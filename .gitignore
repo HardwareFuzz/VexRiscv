@@ -54,3 +54,8 @@ simWorkspace/
 tmp/
 /archive.tar.gz
 *.out32
+ 
+# Local build artifacts we added
+build_result/
+software/skiptrap/build/
+.sbtw

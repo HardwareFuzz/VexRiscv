@@ -19,6 +19,10 @@
 #include <queue>
 #include <time.h>
 #include "encoding.h"
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #define VL_RANDOM_I_WIDTH(w) (VL_RANDOM_I() & (1l << w)-1l)
 
@@ -4162,6 +4166,50 @@ int main(int argc, char **argv, char **env) {
 	printf("BOOT\n");
 	timespec startedAt = timer_start();
 
+    auto endsWith = [](const std::string &value, const std::string &ending)->bool{
+        if (ending.size() > value.size()) return false;
+        return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+    };
+
+    auto fileExists = [](const std::string &path)->bool{
+        FILE *fp = fopen(path.c_str(), "rb");
+        if(!fp) return false;
+        fclose(fp);
+        return true;
+    };
+
+    auto convertElfToIhex = [](const std::string &elfPath)->std::string{
+        // create temp file path
+        char tmpTpl[] = "/tmp/vexriscv_elf_XXXXXX";
+        int fd = mkstemp(tmpTpl);
+        if(fd < 0){
+            std::cerr << "Failed to create temporary file for ihex output" << std::endl;
+            exit(1);
+        }
+        close(fd);
+        std::string hexPath = std::string(tmpTpl) + ".hex";
+
+        // Allow override from env
+        std::vector<std::string> candidates;
+        const char* envObjcopy = getenv("RISCV_OBJCOPY");
+        if(envObjcopy && strlen(envObjcopy)) candidates.emplace_back(envObjcopy);
+        candidates.emplace_back("riscv64-unknown-elf-objcopy");
+        candidates.emplace_back("riscv32-unknown-elf-objcopy");
+
+        int lastRet = -1;
+        for(const auto &oc : candidates){
+            std::string cmd = oc + " -O ihex \"" + elfPath + "\" \"" + hexPath + "\"";
+            lastRet = system(cmd.c_str());
+            if(lastRet == 0){
+                return hexPath;
+            }
+        }
+        std::cerr << "Could not convert ELF to Intel HEX. Tried:";
+        for(const auto &oc : candidates) std::cerr << " " << oc;
+        std::cerr << std::endl;
+        std::cerr << "Hint: install a RISC-V toolchain providing riscv64-unknown-elf-objcopy." << std::endl;
+        exit(2);
+    };
 
 #ifdef LINUX_SOC_SMP
     {
@@ -4275,11 +4323,43 @@ int main(int argc, char **argv, char **env) {
 		#if defined(DEBUG_PLUGIN_EXTERNAL) || defined(RUN_HEX)
 		{
 			WorkspaceRegression w("run");
-			#ifdef RUN_HEX
-			//w.loadHex("/home/spinalvm/hdl/zephyr/zephyrSpinalHdl/samples/synchronization/build/zephyr/zephyr.hex");
-			w.loadHex(RUN_HEX);
-			w.withRiscvRef();
-			#endif
+            // If an argument is provided, treat it as input image:
+            // - .elf: convert to Intel HEX using objcopy then load
+            // - .hex: load directly
+            // Otherwise, fall back to RUN_HEX if defined.
+            if(argc >= 2){
+                std::string in = argv[1];
+                std::string toLoad = in;
+                if(endsWith(in, ".elf")){
+                    toLoad = convertElfToIhex(in);
+                } else if(!endsWith(in, ".hex")){
+                    std::cerr << "Unknown input format: " << in << std::endl;
+                    std::cerr << "Please pass a .elf or .hex image." << std::endl;
+                    exit(3);
+                }
+                if(!fileExists(toLoad)){
+                    std::cerr << "Input file not found: " << toLoad << std::endl;
+                    exit(4);
+                }
+                w.loadHex(toLoad);
+                w.withRiscvRef();
+            } else {
+                #ifdef RUN_HEX
+                {
+                    std::string fallback = std::string(RUN_HEX);
+                    if(fallback.empty()){
+                        std::cerr << "No input provided. Usage: VVexRiscv <program.elf|program.hex>" << std::endl;
+                        exit(5);
+                    }
+                    //w.loadHex("/home/spinalvm/hdl/zephyr/zephyrSpinalHdl/samples/synchronization/build/zephyr/zephyr.hex");
+                    w.loadHex(fallback);
+                    w.withRiscvRef();
+                }
+                #else
+                std::cerr << "No input provided. Usage: VVexRiscv <program.elf|program.hex>" << std::endl;
+                exit(5);
+                #endif
+            }
 			w.setIStall(false);
 			w.setDStall(false);
 
