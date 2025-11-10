@@ -1327,7 +1327,6 @@ public:
 	ofstream regTraces;
 	ofstream memTraces;
 	ofstream logTraces;
-	ofstream debugLog;
 
 	struct timespec start_time;
 
@@ -1481,7 +1480,6 @@ public:
 			memTraces.open (name + ".memTrace");
 		#endif
 		logTraces.open (name + ".logTrace");
-		debugLog.open (name + ".debugTrace");
 		fillSimELements();
 		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
 	}
@@ -1804,7 +1802,6 @@ public:
                 #endif
 
 
-
                 if(top->VexRiscv->lastStageIsFiring){
                    	if(riscvRefEnable) {
 //                        privilegeCounters[riscvRef.privilege]++;
@@ -1947,7 +1944,28 @@ public:
 	virtual void dutPutChar(char c){}
 
 	virtual void dBusAccess(uint32_t addr,bool wr, uint32_t size, uint8_t *dataBytes, bool *error) {
-        uint32_t *data = ((uint32_t*)dataBytes);
+		uint32_t *data = ((uint32_t*)dataBytes);
+
+#ifdef TRACE_ACCESS
+		if(wr){
+			uint32_t logPc = top->VexRiscv->__PVT__memory_to_writeBack_PC;
+			uint64_t value = 0;
+			uint32_t capped = size;
+			if(capped > 8) capped = 8;
+			for(uint32_t b = 0; b < capped; b++){
+				value |= ((uint64_t)((uint8_t*)dataBytes)[b]) << (8*b);
+			}
+			#ifdef TRACE_WITH_TIME
+			memTraces << currentTime;
+			#endif
+			memTraces << " PC " << hex << setw(8) << setfill('0') << logPc;
+			memTraces << " : MEM[0x" << setw(8) << addr << "] <= " << dec << size << " bytes : 0x";
+			uint32_t widthVal = size * 2;
+			if(widthVal < 2) widthVal = 2;
+			memTraces << hex << setw(static_cast<int>(widthVal)) << value;
+			memTraces << dec << setfill(' ') << endl;
+		}
+#endif
 		if(wr){
 			switch(addr){
 			case 0xF0010000u: {

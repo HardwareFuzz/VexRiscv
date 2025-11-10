@@ -20,6 +20,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${ROOT_DIR}/build_result"
+export WITH_RISCV_REF="${WITH_RISCV_REF:-no}"
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -56,11 +57,11 @@ fi
 
 echo "[3/4] Building Verilator simulation (rv32, max extensions)..."
 pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
-make clean
+WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
 # Define RUN_HEX to enable the 'run' code path; runtime arg will override the image.
 # Enable simulation flags to match GenMax features.
-make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF=yes RVD=yes SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64
-make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
+WITH_RISCV_REF="${WITH_RISCV_REF}" make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF=yes RVD=yes SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes
+WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
 popd >/dev/null
 
 echo "[4/4] Packaging..."
