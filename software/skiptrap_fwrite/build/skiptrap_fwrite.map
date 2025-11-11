@@ -1,0 +1,47 @@
+
+There are no discarded input sections
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+onChipRam        0x80000000         0x00020000         w!xr
+*default*        0x00000000         0xffffffff
+
+Linker script and memory map
+
+LOAD build/skiptrap_fwrite.o
+
+.text           0x80000000      0x1ee
+                0x80000000                        . = ALIGN (0x4)
+ *(.text.start)
+ .text.start    0x80000000      0x1ca build/skiptrap_fwrite.o
+                0x80000000                _start
+ *(.text*)
+ .text          0x800001ca       0x24 build/skiptrap_fwrite.o
+ *(.rodata*)
+
+.data           0x800001f0       0xd8
+                0x800001f0                        . = ALIGN (0x4)
+ *(.data*)
+ .data          0x800001f0       0xd8 build/skiptrap_fwrite.o
+
+.bss            0x800002c8        0x0
+                0x800002c8                        . = ALIGN (0x4)
+                0x800002c8                        __bss_start = .
+ *(.bss*)
+ .bss           0x800002c8        0x0 build/skiptrap_fwrite.o
+ *(COMMON)
+                0x800002c8                        __bss_end = .
+                0xf00fff20                        . = 0xf00fff20
+
+.tohost         0xf00fff20        0x8
+ *(.tohost)
+ .tohost        0xf00fff20        0x8 build/skiptrap_fwrite.o
+                0xf00fff20                tohost
+                0xf00fff24                fromhost
+OUTPUT(build/skiptrap_fwrite.elf elf32-littleriscv)
+
+.riscv.attributes
+                0x00000000       0x71
+ .riscv.attributes
+                0x00000000       0x71 build/skiptrap_fwrite.o
