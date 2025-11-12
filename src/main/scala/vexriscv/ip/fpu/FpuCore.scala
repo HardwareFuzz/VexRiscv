@@ -1671,8 +1671,6 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
 
   val writeback = new Area{
     val input = roundBack.output.stage()
-    val fRegisterDebugCycle = Reg(UInt(64 bits)) init(0)
-    fRegisterDebugCycle := fRegisterDebugCycle + 1
 
     for(i <- 0 until portCount){
       val c = io.port(i).completion
@@ -1719,24 +1717,6 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     when(port.valid){
       assert(!(port.data.value.exponent === 0 && !port.data.value.special), "Special violation")
       assert(!(port.data.value.exponent === port.data.value.exponent.maxValue && !port.data.value.special), "Special violation")
-      if(p.withDouble) {
-        printf(p"[FPU][WRITE] cycle=${fRegisterDebugCycle} src=${input.source} rd=${input.rd} write=${input.write} special=${input.value.special} format=${input.format}\n")
-      } else {
-        printf(p"[FPU][WRITE] cycle=${fRegisterDebugCycle} src=${input.source} rd=${input.rd} write=${input.write} special=${input.value.special} format=float\n")
-      }
-      printf(p"           value sign=${input.value.sign} exponent=${input.value.exponent} mantissa=${input.value.mantissa} raw=${input.value.asBits.asUInt}\n")
-      printf(p"           flags NV=${input.NV} DZ=${input.DZ} OF=${input.OF} UF=${input.UF} NX=${input.NX}\n")
-      if(p.withDouble) {
-        printf(p"           boxedWrite=${port.data.boxed} internalMantissaWidth=${input.value.mantissa.getWidth}\n")
-      }
-    }
-
-    when(input.fire && !input.write){
-      if(p.withDouble) {
-        printf(p"[FPU][WRITE] cycle=${fRegisterDebugCycle} src=${input.source} rd=${input.rd} suppressed write format=${input.format} flags NV=${input.NV} DZ=${input.DZ} OF=${input.OF} UF=${input.UF} NX=${input.NX}\n")
-      } else {
-        printf(p"[FPU][WRITE] cycle=${fRegisterDebugCycle} src=${input.source} rd=${input.rd} suppressed write format=float flags NV=${input.NV} DZ=${input.DZ} OF=${input.OF} UF=${input.UF} NX=${input.NX}\n")
-      }
     }
   }
 }

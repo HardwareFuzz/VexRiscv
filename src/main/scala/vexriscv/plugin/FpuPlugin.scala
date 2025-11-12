@@ -335,6 +335,14 @@ class FpuPlugin(externalFpu : Boolean = false,
       commit.write := arbitration.isValid && !arbitration.removeIt
       commit.opcode := input(FPU_OPCODE)
       commit.rd := input(INSTRUCTION)(rdRange).asUInt
+      val fregTraceFormat = if(p.withDouble) "PC %08x : f[%02d] = 0x%016x\n" else "PC %08x : f[%02d] = 0x%08x\n"
+      when(commit.fire && commit.write){
+        printf(fregTraceFormat,
+          input(PC),
+          commit.rd.resized,
+          commit.value.asBits.asUInt
+        )
+      }
 
       when(isCommit && !commit.ready){
         arbitration.haltByOther := True
