@@ -263,7 +263,8 @@ def verify_fregs(freg_entries, pcs):
         if key and pc is None:
             failures.append(f"[freg] Missing ASM PC for {key}")
             continue
-        match = find_fwrite(freg_entries, rd, val, bits, None)
+        # Require matching PC when an ASM key is known; otherwise match by rd/value only
+        match = find_fwrite(freg_entries, rd, val, bits, pc)
         if not match:
             if pc is None:
                 base = f"[freg] Missing f[{rd}] = 0x{val:0{bits//4}X}"

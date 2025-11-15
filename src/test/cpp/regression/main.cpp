@@ -1,5 +1,6 @@
 #include "VVexRiscv.h"
 #include "VVexRiscv_VexRiscv.h"
+#include "VVexRiscv_FpuCore.h"
 #ifdef REF
 #include "VVexRiscv_RiscvCore.h"
 #endif
@@ -1327,6 +1328,7 @@ public:
 	ofstream regTraces;
 	ofstream memTraces;
 	ofstream logTraces;
+	ofstream fregTraces;
 
 	struct timespec start_time;
 
@@ -1480,6 +1482,7 @@ public:
 			memTraces.open (name + ".memTrace");
 		#endif
 		logTraces.open (name + ".logTrace");
+		fregTraces.open(name + ".fregTrace");
 		fillSimELements();
 		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
 	}
@@ -1774,13 +1777,31 @@ public:
 				#endif
 
                 #ifdef RVF
-                if(riscvRefEnable) {
-                    if(top->VexRiscv->writeBack_FpuPlugin_commit_valid && top->VexRiscv->writeBack_FpuPlugin_commit_ready && top->VexRiscv->writeBack_FpuPlugin_commit_payload_write){
+                // Capture DUT FPU commit stream for the golden model
+                if(top->VexRiscv->writeBack_FpuPlugin_commit_valid &&
+                   top->VexRiscv->writeBack_FpuPlugin_commit_ready &&
+                   top->VexRiscv->writeBack_FpuPlugin_commit_payload_write){
+
+                    if(riscvRefEnable){
                         FpuCommit c;
                         c.value = top->VexRiscv->writeBack_FpuPlugin_commit_payload_value;
                         riscvRef.fpuCommit.push(c);
                     }
+                }
 
+                // Architectural F-register writeback trace from FpuCore
+                if(top->VexRiscv->FpuPlugin_fpu && top->VexRiscv->FpuPlugin_fpu->fregWriteValid){
+                    uint32_t fpc  = top->VexRiscv->lastStagePc;
+                    uint32_t frd  = top->VexRiscv->FpuPlugin_fpu->fregWriteReg;
+                    uint64_t fval = top->VexRiscv->FpuPlugin_fpu->fregWriteData;
+                    fregTraces
+                        << "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
+                        << " : f[" << std::dec << std::setw(2) << (uint32_t)frd
+                        << "] = 0x" << std::hex << std::setw(16) << std::setfill('0') << fval
+                        << std::dec << std::setfill(' ') << std::endl;
+                }
+
+                if(riscvRefEnable){
                     if(top->VexRiscv->FpuPlugin_port_rsp_valid && top->VexRiscv->FpuPlugin_port_rsp_ready && top->VexRiscv->lastStageIsFiring){
                         FpuRsp c;
                         c.value = top->VexRiscv->FpuPlugin_port_rsp_payload_value;
@@ -1861,11 +1882,11 @@ public:
                         // Log exception PC and RISC-V exception cause code (stdout + run.logTrace)
                         std::cout << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
                                   << top->VexRiscv->lastStagePc
-                                  << " cause=" << std::dec << (unsigned)top->VexRiscv->__PVT__CsrPlugin_trapCause
+                                  << " cause=" << std::dec << (unsigned)top->VexRiscv->CsrPlugin_trapCause
                                   << std::setfill(' ') << std::endl;
                         logTraces << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
                                   << top->VexRiscv->lastStagePc
-                                  << " cause=" << std::dec << (unsigned)top->VexRiscv->__PVT__CsrPlugin_trapCause
+                                  << " cause=" << std::dec << (unsigned)top->VexRiscv->CsrPlugin_trapCause
                                   << std::setfill(' ') << std::endl;
                         if(riscvRefEnable) {
                             riscvRef.step();

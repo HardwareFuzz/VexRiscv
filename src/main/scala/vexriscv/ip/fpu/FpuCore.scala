@@ -1672,6 +1672,108 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
   val writeback = new Area{
     val input = roundBack.output.stage()
 
+    // Debug: architectural F-register writeback view (IEEE754 / box32) for simulation
+    val fregWriteValid = Bool().setName("fregWriteValid").addAttribute(Verilator.public)
+    val fregWriteReg   = UInt(p.rfAddress.getBitsWidth bits).setName("fregWriteReg").addAttribute(Verilator.public)
+    val fregWriteData  = p.storeLoadType().setName("fregWriteData").addAttribute(Verilator.public)
+
+    fregWriteValid := False
+    fregWriteReg   := 0
+    fregWriteData  := 0
+
+    when(input.valid && input.write){
+      fregWriteValid := True
+      fregWriteReg   := input.rd
+      if(p.withDouble) {
+        val sign = B(input.value.sign)
+        val ieee = Bits(64 bits)
+        ieee := 0
+
+        whenDouble(input.format){
+          // Double-precision IEEE754
+          val expBase = (input.value.exponent - U(exponentOne-1023)).resize(11 bits)
+          val manBase = input.value.mantissa.asBits
+          val expFixed = UInt(11 bits)
+          val manFixed = UInt(52 bits)
+          expFixed := expBase
+          manFixed := manBase.asUInt
+
+          when(input.value.isZero){
+            expFixed := 0
+            manFixed := 0
+          } elsewhen(input.value.isInfinity){
+            expFixed.setAll()
+            manFixed := 0
+          } elsewhen(input.value.isNan){
+            expFixed.setAll()
+            when(input.value.isCanonical){
+              manFixed := U((BigInt(1) << 51), 52 bits)
+            } otherwise {
+              manFixed := (manBase.asUInt | U((BigInt(1) << 51), 52 bits))
+            }
+          }
+
+          ieee := sign ## expFixed.asBits ## manFixed.asBits
+        }{
+          // Single-precision IEEE754, boxed into 64 bits (0xFFFFFFFFxxxxxxxx)
+          val expBase32 = (input.value.exponent - U(exponentOne-127)).resize(8 bits)
+          val manSlice = if(p.withDouble) input.value.mantissa(51 downto 29) else input.value.mantissa(22 downto 0)
+          val manBase32 = manSlice.asBits
+          val expFixed32 = UInt(8 bits)
+          val manFixed32 = UInt(23 bits)
+          expFixed32 := expBase32
+          manFixed32 := manBase32.asUInt
+
+          when(input.value.isZero){
+            expFixed32 := 0
+            manFixed32 := 0
+          } elsewhen(input.value.isInfinity){
+            expFixed32.setAll()
+            manFixed32 := 0
+          } elsewhen(input.value.isNan){
+            expFixed32.setAll()
+            when(input.value.isCanonical){
+              manFixed32 := U((BigInt(1) << 22), 23 bits)
+            } otherwise {
+              manFixed32 := (manBase32.asUInt | U((BigInt(1) << 22), 23 bits))
+            }
+          }
+
+          val ieee32 = sign ## expFixed32.asBits ## manFixed32.asBits
+          ieee := B"xFFFFFFFF" ## ieee32
+        }
+
+        fregWriteData := ieee
+      } else {
+        // RV32F only: 32-bit IEEE754
+        val sign = B(input.value.sign)
+        val expBase32 = (input.value.exponent - U(exponentOne-127)).resize(8 bits)
+        val manBase32 = input.value.mantissa(22 downto 0).asBits
+        val expFixed32 = UInt(8 bits)
+        val manFixed32 = UInt(23 bits)
+        expFixed32 := expBase32
+        manFixed32 := manBase32.asUInt
+
+        when(input.value.isZero){
+          expFixed32 := 0
+          manFixed32 := 0
+        } elsewhen(input.value.isInfinity){
+          expFixed32.setAll()
+          manFixed32 := 0
+        } elsewhen(input.value.isNan){
+          expFixed32.setAll()
+          when(input.value.isCanonical){
+            manFixed32 := U((BigInt(1) << 22), 23 bits)
+          } otherwise {
+            manFixed32 := (manBase32.asUInt | U((BigInt(1) << 22), 23 bits))
+          }
+        }
+
+        val ieee32 = sign ## expFixed32.asBits ## manFixed32.asBits
+        fregWriteData := ieee32
+      }
+    }
+
     for(i <- 0 until portCount){
       val c = io.port(i).completion
       c.valid := input.fire && input.source === i
