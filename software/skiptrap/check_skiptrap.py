@@ -7,6 +7,7 @@ from pathlib import Path
 FREGTRACE = re.compile(r"^(?:\s*\d+\s+)?PC\s+([0-9a-fA-F]{8})\s+:\s+f\[\s*(\d+)\s*\]\s*=\s*0x([0-9a-fA-F]+)\s*$")
 MEMTRACE = re.compile(r"^(?:\s*\d+\s+)?PC\s+([0-9a-fA-F]{8})\s+:\s+MEM\[(0x[0-9a-fA-F]+)\]\s+<=\s+(\d+)\s+bytes\s+:\s+0x([0-9a-fA-F]+)")
 ASM_LINE = re.compile(r"^\s*([0-9a-fA-F]{8}):\s+(.*)$")
+EXC_LINE = re.compile(r"^EXC\s+pc=0x([0-9a-fA-F]{8})\s+cause=(\d+)\s*$")
 
 ASM_FPCS = {
     "flw_ft0"         : re.compile(r"^\s*([0-9a-fA-F]{8}):\s+[0-9a-fA-F]+\s+flw\s+ft0,0\(t2\)"),
@@ -89,6 +90,22 @@ def asm_map_by_pc(path):
             if match:
                 mapping[int(match.group(1), 16)] = match.group(2).strip()
     return mapping
+
+
+def parse_exc_log(path):
+    entries = []
+    if not path.exists():
+        return entries
+    with path.open('r', errors='ignore') as f:
+        for line in f:
+            m = EXC_LINE.match(line.strip())
+            if not m:
+                continue
+            entries.append({
+                "pc": int(m.group(1), 16),
+                "cause": int(m.group(2)),
+            })
+    return entries
 
 def find_fwrite(entries, rd, val, bits=None, pc=None):
     for entry in entries:
@@ -291,11 +308,76 @@ def verify_mem(mem_entries, asm_lookup, symbols):
             failures.append(f"[mem] #{idx}: PC 0x{entry['pc']:08X} line '{asm_line}' mismatched /{spec['asm']}/")
     return failures
 
+
+def expected_exceptions_from_asm(asm_path):
+    patterns = [
+        ("ecall", 11, re.compile(r"^\s*([0-9a-fA-F]{8}):\s+[0-9a-fA-F]+\s+ecall\b")),
+        ("lw_misaligned", 4, re.compile(r"^\s*([0-9a-fA-F]{8}):\s+[0-9a-fA-F]+\s+lw\s+t4,1\(t2\)")),
+        ("illegal_insn", 2, re.compile(r"^\s*([0-9a-fA-F]{8}):\s+[0-9a-fA-F]+\s+\.word\s+0xffffffff")),
+    ]
+
+    expected = []
+    seen = {name: False for (name, _, _) in patterns}
+
+    with asm_path.open('r', errors='ignore') as f:
+        for line in f:
+            for name, cause, regex in patterns:
+                if seen[name]:
+                    continue
+                m = regex.match(line)
+                if m:
+                    expected.append({
+                        "label": name,
+                        "pc": int(m.group(1), 16),
+                        "cause": cause,
+                    })
+                    seen[name] = True
+                    break
+
+    missing = [name for (name, _, _) in patterns if not seen[name]]
+    return expected, missing
+
+
+def verify_exceptions(exc_entries, asm_path):
+    failures = []
+    expected, missing = expected_exceptions_from_asm(asm_path)
+
+    for name in missing:
+        failures.append(f"[exc] Missing expected trap site for {name} in {asm_path.name}")
+
+    if not expected:
+        return failures
+
+    if not exc_entries:
+        failures.append("[exc] No EXC lines found in run.logTrace; ensure simulator emits exception logs")
+        return failures
+
+    for spec in expected:
+        match = None
+        for entry in exc_entries:
+            if entry["pc"] == spec["pc"] and entry["cause"] == spec["cause"]:
+                match = entry
+                break
+        if not match:
+            same_pc = [e for e in exc_entries if e["pc"] == spec["pc"]]
+            same_cause = [e for e in exc_entries if e["cause"] == spec["cause"]]
+            base = f"[exc] Missing EXC pc=0x{spec['pc']:08X} cause={spec['cause']} ({spec['label']})"
+            if same_pc:
+                observed = ", ".join(str(e["cause"]) for e in same_pc[:3])
+                base += f"; observed causes at that PC: {observed}"
+            elif same_cause:
+                observed = ", ".join(f"0x{e['pc']:08X}" for e in same_cause[:3])
+                base += f"; observed PCs for that cause: {observed}"
+            failures.append(base)
+
+    return failures
+
 def main():
     root = Path(__file__).resolve().parents[2]
     skiptrap_dir = Path(__file__).resolve().parent
     freg_path = root / "run.fregTrace"
     mem_path = root / "run.memTrace"
+    log_path = root / "run.logTrace"
     asm_path = skiptrap_dir / "build" / "skiptrap.asm"
     elf_path = skiptrap_dir / "build" / "skiptrap.elf"
 
@@ -305,6 +387,7 @@ def main():
 
     freg_entries = parse_fregtrace(freg_path)
     mem_entries = parse_memtrace(mem_path)
+    exc_entries = parse_exc_log(log_path)
     pcs = parse_asm_pcs(asm_path)
     asm_lookup = asm_map_by_pc(asm_path)
     symbols, sym_err = load_symbol_map(elf_path)
@@ -315,6 +398,7 @@ def main():
 
     failures.extend(verify_fregs(freg_entries, pcs))
     failures.extend(verify_mem(mem_entries, asm_lookup, symbols))
+    failures.extend(verify_exceptions(exc_entries, asm_path))
 
     if failures:
         print("SKIPTRAP TRACE CHECK: FAIL")

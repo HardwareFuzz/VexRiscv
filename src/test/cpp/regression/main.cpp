@@ -1858,6 +1858,15 @@ public:
 
                 #ifdef CSR
                     if(top->VexRiscv->CsrPlugin_hadException){
+                        // Log exception PC and RISC-V exception cause code (stdout + run.logTrace)
+                        std::cout << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
+                                  << top->VexRiscv->lastStagePc
+                                  << " cause=" << std::dec << (unsigned)top->VexRiscv->__PVT__CsrPlugin_trapCause
+                                  << std::setfill(' ') << std::endl;
+                        logTraces << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
+                                  << top->VexRiscv->lastStagePc
+                                  << " cause=" << std::dec << (unsigned)top->VexRiscv->__PVT__CsrPlugin_trapCause
+                                  << std::setfill(' ') << std::endl;
                         if(riscvRefEnable) {
                             riscvRef.step();
                         }

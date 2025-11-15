@@ -1365,7 +1365,7 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
         targetPrivilege := exceptionPortCtrl.exceptionTargetPrivilege
       }
 
-      val trapCause = CombInit(interrupt.code.resize(trapCodeWidth))
+      val trapCause = CombInit(interrupt.code.resize(trapCodeWidth)).addTag(Verilator.public)
       val trapCauseEbreakDebug = False
       if(exceptionPortCtrl != null) when( hadException){
         trapCause := exceptionPortCtrl.exceptionContext.code.resized
