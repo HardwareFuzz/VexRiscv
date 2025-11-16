@@ -31,8 +31,8 @@ using namespace std;
 
 struct timespec timer_get(){
     struct timespec start_time;
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
-    return start_time;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
+	return start_time;
 }
 
 class Memory{
@@ -1330,6 +1330,15 @@ public:
 	ofstream logTraces;
 	ofstream fregTraces;
 
+#ifdef RVF
+	struct FpuIssueInfo {
+		uint32_t pc;
+		uint8_t rd;
+		uint8_t opcode;
+	};
+	std::vector<FpuIssueInfo> fpuPending;
+#endif
+
 	struct timespec start_time;
 
     class CpuRef : public RiscvGolden{
@@ -1776,32 +1785,47 @@ public:
                     }
 				#endif
 
-                #ifdef RVF
-                // Capture DUT FPU commit stream for the golden model
-                if(top->VexRiscv->writeBack_FpuPlugin_commit_valid &&
-                   top->VexRiscv->writeBack_FpuPlugin_commit_ready &&
-                   top->VexRiscv->writeBack_FpuPlugin_commit_payload_write){
+				#ifdef RVF
+				// Capture DUT FPU commit stream for the golden model and track
+				// architectural PCs for FP register writes.
+				if(top->VexRiscv->writeBack_FpuPlugin_commit_valid &&
+				   top->VexRiscv->writeBack_FpuPlugin_commit_ready &&
+				   top->VexRiscv->writeBack_FpuPlugin_commit_payload_write){
 
-                    if(riscvRefEnable){
-                        FpuCommit c;
-                        c.value = top->VexRiscv->writeBack_FpuPlugin_commit_payload_value;
-                        riscvRef.fpuCommit.push(c);
-                    }
-                }
+					if(riscvRefEnable){
+						FpuCommit c;
+						c.value = top->VexRiscv->writeBack_FpuPlugin_commit_payload_value;
+						riscvRef.fpuCommit.push(c);
+					}
 
-                // Architectural F-register writeback trace from FpuCore
-                if(top->VexRiscv->FpuPlugin_fpu && top->VexRiscv->FpuPlugin_fpu->fregWriteValid){
-                    uint32_t fpc  = top->VexRiscv->lastStagePc;
-                    uint32_t frd  = top->VexRiscv->FpuPlugin_fpu->fregWriteReg;
-                    uint64_t fval = top->VexRiscv->FpuPlugin_fpu->fregWriteData;
-                    fregTraces
-                        << "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
-                        << " : f[" << std::dec << std::setw(2) << (uint32_t)frd
-                        << "] = 0x" << std::hex << std::setw(16) << std::setfill('0') << fval
-                        << std::dec << std::setfill(' ') << std::endl;
-                }
+					FpuIssueInfo info;
+					info.pc = top->VexRiscv->lastStagePc;
+					info.rd = top->VexRiscv->writeBack_FpuPlugin_commit_payload_rd;
+					info.opcode = top->VexRiscv->writeBack_FpuPlugin_commit_payload_opcode;
+					fpuPending.push_back(info);
+				}
 
-                if(riscvRefEnable){
+				// Architectural F-register writeback trace from FpuCore, tagged with
+				// the original instruction PC captured at FPU command issue time.
+				if(top->VexRiscv->FpuPlugin_fpu && top->VexRiscv->FpuPlugin_fpu->fregWriteValid){
+					uint32_t fpc = top->VexRiscv->lastStagePc;
+					uint32_t frdHw  = top->VexRiscv->FpuPlugin_fpu->fregWriteReg;
+					uint64_t fval = top->VexRiscv->FpuPlugin_fpu->fregWriteData;
+					for(auto it = fpuPending.begin(); it != fpuPending.end(); ++it){
+						if(it->rd == frdHw){
+							fpc = it->pc;
+							fpuPending.erase(it);
+							break;
+						}
+					}
+					fregTraces
+						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
+						<< " : f[" << std::dec << std::setw(2) << (uint32_t)frdHw
+						<< "] = 0x" << std::hex << std::setw(16) << std::setfill('0') << fval
+						<< std::dec << std::setfill(' ') << std::endl;
+				}
+
+				if(riscvRefEnable){
                     if(top->VexRiscv->FpuPlugin_port_rsp_valid && top->VexRiscv->FpuPlugin_port_rsp_ready && top->VexRiscv->lastStageIsFiring){
                         FpuRsp c;
                         c.value = top->VexRiscv->FpuPlugin_port_rsp_payload_value;

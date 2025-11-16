@@ -59,3 +59,4 @@ tmp/
 build_result/
 software/skiptrap/build/
 .sbtw
+*Trace
