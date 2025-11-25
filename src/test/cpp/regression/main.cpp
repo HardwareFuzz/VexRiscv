@@ -881,7 +881,7 @@ public:
                 #ifdef RVD
                 if(size > 8) ilegalInstruction();
                 #else
-                if(format > 4) ilegalInstruction();
+				if(size > 4) ilegalInstruction();
                 #endif
                 auto commit = fpuCommit.front();  fpuCommit.pop();
                 fpuCompletionTockens += 1;
@@ -912,7 +912,7 @@ public:
                 #ifdef RVD
                 if(size > 8) ilegalInstruction();
                 #else
-                if(format > 4) ilegalInstruction();
+				if(size > 4) ilegalInstruction();
                 #endif
 
                 auto rsp = fpuRsp.front(); fpuRsp.pop();
@@ -1810,7 +1810,11 @@ public:
 				if(top->VexRiscv->FpuPlugin_fpu && top->VexRiscv->FpuPlugin_fpu->fregWriteValid){
 					uint32_t fpc = top->VexRiscv->lastStagePc;
 					uint32_t frdHw  = top->VexRiscv->FpuPlugin_fpu->fregWriteReg;
+					#ifdef RVD
 					uint64_t fval = top->VexRiscv->FpuPlugin_fpu->fregWriteData;
+					#else
+					uint32_t fval = top->VexRiscv->FpuPlugin_fpu->fregWriteData;
+					#endif
 					for(auto it = fpuPending.begin(); it != fpuPending.end(); ++it){
 						if(it->rd == frdHw){
 							fpc = it->pc;
@@ -1821,7 +1825,13 @@ public:
 					fregTraces
 						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
 						<< " : f[" << std::dec << std::setw(2) << (uint32_t)frdHw
-						<< "] = 0x" << std::hex << std::setw(16) << std::setfill('0') << fval
+						<< "] = 0x" << std::hex
+						#ifdef RVD
+						<< std::setw(16)
+						#else
+						<< std::setw(8)
+						#endif
+						<< std::setfill('0') << fval
 						<< std::dec << std::setfill(' ') << std::endl;
 				}
 

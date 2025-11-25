@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a Verilator-based VexRiscv simulator that accepts an ELF/HEX path.
-# Output binary: build_result/genfull_rv32
+# Build Verilator-based VexRiscv simulators that accept an ELF/HEX path.
+# Output binaries:
+#   - build_result/vex_rv32d : RV32IMAFD + S-mode + MMU (GenMax)
+#   - build_result/vex_rv32f : RV32IMAF  + S-mode + MMU (GenMaxRv32F)
 #
 # Requirements:
 # - Java (for Scala codegen)
@@ -45,32 +47,38 @@ if ! command_exists sbt; then
   fi
 fi
 
-echo "[2/4] Generating RTL (VexRiscv.v) with Scala/SBT..."
-if [[ ! -f "${ROOT_DIR}/VexRiscv.v" ]] || [[ "${FORCE_REGEN:-}" == "1" ]]; then
-  pushd "${ROOT_DIR}" >/dev/null
-  # Generate a RV32 core with maximum extensions (compressed, LR/SC, AMO, FPU D, S-mode, MMU)
-  "${SBT_CMD}" "runMain vexriscv.demo.GenMax"
-  popd >/dev/null
-else
-  echo "[skip] VexRiscv.v already present."
-fi
+mkdir -p "${OUT_DIR}"
+rm -f "${OUT_DIR}/vex_rv32d" "${OUT_DIR}/vex_rv32f"
 
-echo "[3/4] Building Verilator simulation (rv32, max extensions)..."
+echo "[2/4] Building RV32D (GenMax, RVF+RVD)..."
+pushd "${ROOT_DIR}" >/dev/null
+"${SBT_CMD}" "runMain vexriscv.demo.GenMax"
+popd >/dev/null
+
 pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
 WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
-# Define RUN_HEX to enable the 'run' code path; runtime arg will override the image.
-# Enable simulation flags to match GenMax features.
 WITH_RISCV_REF="${WITH_RISCV_REF}" make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF=yes RVD=yes SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes
 WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
+cp -f "${ROOT_DIR}/src/test/cpp/regression/obj_dir/VVexRiscv" "${OUT_DIR}/vex_rv32d"
+chmod +x "${OUT_DIR}/vex_rv32d"
+popd >/dev/null
+
+echo "[3/4] Building RV32F (GenMaxRv32F, RVF only)..."
+pushd "${ROOT_DIR}" >/dev/null
+"${SBT_CMD}" "runMain vexriscv.demo.GenMaxRv32F"
+popd >/dev/null
+
+pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
+WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
+WITH_RISCV_REF="${WITH_RISCV_REF}" make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF=yes RVD=no SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes
+WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
+cp -f "${ROOT_DIR}/src/test/cpp/regression/obj_dir/VVexRiscv" "${OUT_DIR}/vex_rv32f"
+chmod +x "${OUT_DIR}/vex_rv32f"
 popd >/dev/null
 
 echo "[4/4] Packaging..."
-mkdir -p "${OUT_DIR}"
-# Clean previous outputs to keep only the max-extensions binary
-find "${OUT_DIR}" -maxdepth 1 -type f -exec rm -f {} +
-cp -f "${ROOT_DIR}/src/test/cpp/regression/obj_dir/VVexRiscv" "${OUT_DIR}/vex_rv32"
-chmod +x "${OUT_DIR}/vex_rv32"
-echo "Done: ${OUT_DIR}/vex_rv32"
+echo "Done: ${OUT_DIR}/vex_rv32d"
+echo "Done: ${OUT_DIR}/vex_rv32f"
 
 # RV64 status
 echo
@@ -79,5 +87,5 @@ echo "  This repository (VexRiscv) implements a 32-bit RISC-V core (RV32)."
 echo "  Building an RV64 core is not supported here; skipping rv64 build."
 echo
 echo "Run example:"
-echo "  ${OUT_DIR}/vex_rv32 path/to/program.elf"
-echo "  ${OUT_DIR}/vex_rv32 path/to/program.hex"
+echo "  ${OUT_DIR}/vex_rv32d path/to/program.elf   # RV32IMAFD"
+echo "  ${OUT_DIR}/vex_rv32f path/to/program.elf   # RV32IMAF"
