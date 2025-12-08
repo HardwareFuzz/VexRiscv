@@ -60,3 +60,4 @@ build_result/
 software/skiptrap/build/
 .sbtw
 *Trace
+logs/

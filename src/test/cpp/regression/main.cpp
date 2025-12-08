@@ -6,6 +6,7 @@
 #endif
 #include "verilated.h"
 #include "verilated_fst_c.h"
+#include "verilated_cov.h"
 #include <stdio.h>
 #include <iostream>
 #include <stdlib.h>
@@ -28,6 +29,16 @@
 #define VL_RANDOM_I_WIDTH(w) (VL_RANDOM_I() & (1l << w)-1l)
 
 using namespace std;
+
+#if VM_COVERAGE
+static std::string g_cov_path;
+
+static void write_coverage_dat() {
+	if (g_cov_path.empty()) return;
+	Verilated::threadContextp()->coveragep()->write(g_cov_path.c_str());
+	printf("  Coverage: %s\n", g_cov_path.c_str());
+}
+#endif
 
 struct timespec timer_get(){
     struct timespec start_time;
@@ -4245,6 +4256,22 @@ int main(int argc, char **argv, char **env) {
 	Verilated::randReset(2);
 	Verilated::commandArgs(argc, argv);
 
+#if VM_COVERAGE
+	g_cov_path = "logs/coverage.dat";
+	if (const char* cov_arg = Verilated::commandArgsPlusMatch("covfile=")) {
+		const char* val = cov_arg + std::strlen("+covfile=");
+		if (*val) g_cov_path = val;
+	}
+	const auto slash_pos = g_cov_path.find_last_of('/');
+	if (slash_pos != std::string::npos && slash_pos != 0) {
+		Verilated::mkdir(g_cov_path.substr(0, slash_pos).c_str());
+	} else {
+		Verilated::mkdir("logs");
+	}
+	Verilated::threadContextp()->coveragep()->zero();
+	atexit(write_coverage_dat);
+#endif
+
 	printf("BOOT\n");
 	timespec startedAt = timer_start();
 
@@ -4405,12 +4432,18 @@ int main(int argc, char **argv, char **env) {
 		#if defined(DEBUG_PLUGIN_EXTERNAL) || defined(RUN_HEX)
 		{
 			WorkspaceRegression w("run");
+            int imageArgIdx = -1;
+            for (int i = 1; i < argc; ++i) {
+                if (argv[i][0] == '+') continue;
+                imageArgIdx = i;
+                break;
+            }
             // If an argument is provided, treat it as input image:
             // - .elf: convert to Intel HEX using objcopy then load
             // - .hex: load directly
             // Otherwise, fall back to RUN_HEX if defined.
-            if(argc >= 2){
-                std::string in = argv[1];
+            if(imageArgIdx != -1){
+                std::string in = argv[imageArgIdx];
                 std::string toLoad = in;
                 if(endsWith(in, ".elf")){
                     toLoad = convertElfToIhex(in);
