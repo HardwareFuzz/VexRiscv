@@ -3,23 +3,25 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./build.sh [--coverage] [--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
+Usage: ./build.sh [--coverage|--coverage-light|--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
 
 Build Verilator-based VexRiscv simulators that accept an ELF/HEX path.
-- Default builds RV32D (GenMax) and RV32F (GenMaxRv32F) binaries in build_result/.
-- Pass --coverage to build coverage-enabled binaries (suffix *_cov) with Verilator --coverage.
+- Default builds RV32FD (GenMax) and RV32F (GenMaxRv32F) binaries in build_result/.
+- Pass --coverage to build full coverage-enabled binaries (suffix *_cov) with Verilator --coverage.
+- Pass --coverage-light to build lightweight coverage binaries (suffix *_cov_light) with line/user-only coverage.
 - Arguments after "--" are forwarded to Verilator (e.g. -- --compiler clang).
 EOF
 }
 
-COVERAGE=0
+COVERAGE_MODE="${COVERAGE_MODE:-none}" # none|full|light
 CLEAN=0
 EXTRA_VERILATOR_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --coverage|-c) COVERAGE=1 ;;
-        --no-coverage|-n) COVERAGE=0 ;;
+        --coverage|-c) COVERAGE_MODE="full" ;;
+        --coverage-light) COVERAGE_MODE="light" ;;
+        --no-coverage|-n) COVERAGE_MODE="none" ;;
         --clean) CLEAN=1 ;;
         --help|-h) usage; exit 0 ;;
         --) shift; EXTRA_VERILATOR_ARGS+=("$@"); break ;;
@@ -30,8 +32,8 @@ done
 
 # Build Verilator-based VexRiscv simulators that accept an ELF/HEX path.
 # Output binaries:
-#   - build_result/vex_rv32d[[_cov]] : RV32IMAFD + S-mode + MMU (GenMax)
-#   - build_result/vex_rv32f[[_cov]] : RV32IMAF  + S-mode + MMU (GenMaxRv32F)
+#   - build_result/vex_rv32_fd[[_cov|_cov_light]] : RV32IMAFD + S-mode + MMU (GenMax)
+#   - build_result/vex_rv32_f[[_cov|_cov_light]]  : RV32IMAF  + S-mode + MMU (GenMaxRv32F)
 #
 # Requirements:
 # - Java (for Scala codegen)
@@ -49,22 +51,44 @@ export WITH_RISCV_REF="${WITH_RISCV_REF:-no}"
 
 BIN_SUFFIX=""
 BUILD_KIND="standard"
-if (( COVERAGE )); then
-    BIN_SUFFIX="_cov"
-    BUILD_KIND="coverage"
-fi
+case "$COVERAGE_MODE" in
+    full)
+        BIN_SUFFIX="_cov"
+        BUILD_KIND="full coverage"
+        ;;
+    light)
+        BIN_SUFFIX="_cov_light"
+        BUILD_KIND="light coverage"
+        ;;
+    none)
+        BIN_SUFFIX=""
+        BUILD_KIND="standard"
+        ;;
+esac
 
 VERILATOR_ARGS_STR="${EXTRA_VERILATOR_ARGS[*]-}"
-if (( COVERAGE )); then
-    if [[ -n "$VERILATOR_ARGS_STR" ]]; then
-        VERILATOR_ARGS_STR="--coverage ${VERILATOR_ARGS_STR}"
-    else
-        VERILATOR_ARGS_STR="--coverage"
-    fi
-fi
+case "$COVERAGE_MODE" in
+    full)
+        if [[ -n "$VERILATOR_ARGS_STR" ]]; then
+            VERILATOR_ARGS_STR="--coverage ${VERILATOR_ARGS_STR}"
+        else
+            VERILATOR_ARGS_STR="--coverage"
+        fi
+        ;;
+    light)
+        if [[ -n "$VERILATOR_ARGS_STR" ]]; then
+            VERILATOR_ARGS_STR="--coverage-line --coverage-user --coverage-max-width 0 ${VERILATOR_ARGS_STR}"
+        else
+            VERILATOR_ARGS_STR="--coverage-line --coverage-user --coverage-max-width 0"
+        fi
+        ;;
+    none)
+        # No additional coverage flags
+        ;;
+esac
 
-OUT_BIN_D="${OUT_DIR}/vex_rv32d${BIN_SUFFIX}"
-OUT_BIN_F="${OUT_DIR}/vex_rv32f${BIN_SUFFIX}"
+OUT_BIN_FD="${OUT_DIR}/vex_rv32_fd${BIN_SUFFIX}"
+OUT_BIN_F="${OUT_DIR}/vex_rv32_f${BIN_SUFFIX}"
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -92,9 +116,11 @@ fi
 mkdir -p "${OUT_DIR}"
 if (( CLEAN )); then
   rm -rf "${ROOT_DIR}/src/test/cpp/regression/obj_dir"
-  rm -f "${OUT_DIR}/vex_rv32d" "${OUT_DIR}/vex_rv32f" "${OUT_DIR}/vex_rv32d_cov" "${OUT_DIR}/vex_rv32f_cov"
+  rm -f "${OUT_DIR}/vex_rv32_fd" "${OUT_DIR}/vex_rv32_f" \
+        "${OUT_DIR}/vex_rv32_fd_cov" "${OUT_DIR}/vex_rv32_f_cov" \
+        "${OUT_DIR}/vex_rv32_fd_cov_light" "${OUT_DIR}/vex_rv32_f_cov_light"
 else
-  rm -f "${OUT_BIN_D}" "${OUT_BIN_F}"
+  rm -f "${OUT_BIN_FD}" "${OUT_BIN_F}"
 fi
 
 build_variant() {
@@ -119,17 +145,19 @@ build_variant() {
     popd >/dev/null
 }
 
-echo "[2/4] Building RV32D (GenMax, RVF+RVD)..."
-build_variant "RV32D" "vexriscv.demo.GenMax" yes yes "${OUT_BIN_D}"
+echo "[2/4] Building RV32FD (GenMax, RVF+RVD)..."
+build_variant "RV32FD" "vexriscv.demo.GenMax" yes yes "${OUT_BIN_FD}"
 
 echo "[3/4] Building RV32F (GenMaxRv32F, RVF only)..."
 build_variant "RV32F" "vexriscv.demo.GenMaxRv32F" yes no "${OUT_BIN_F}"
 
 echo "[4/4] Packaging..."
-echo "Done: ${OUT_BIN_D}"
+echo "Done: ${OUT_BIN_FD}"
 echo "Done: ${OUT_BIN_F}"
-if (( COVERAGE )); then
+if [[ "$COVERAGE_MODE" == "full" ]]; then
   echo "Coverage enabled (Verilator --coverage). Use +covfile=<path> when running to override logs/coverage.dat."
+elif [[ "$COVERAGE_MODE" == "light" ]]; then
+  echo "Light coverage enabled (--coverage-line --coverage-user). Use +covfile=<path> when running to override logs/coverage.dat."
 fi
 
 # RV64 status
@@ -139,5 +167,5 @@ echo "  This repository (VexRiscv) implements a 32-bit RISC-V core (RV32)."
 echo "  Building an RV64 core is not supported here; skipping rv64 build."
 echo
 echo "Run example:"
-echo "  ${OUT_BIN_D} path/to/program.elf   # RV32IMAFD"
-echo "  ${OUT_BIN_F} path/to/program.elf   # RV32IMAF"
+echo "  ${OUT_BIN_FD} path/to/program.elf   # RV32IMAFD"
+echo "  ${OUT_BIN_F} path/to/program.elf    # RV32IMAF"
