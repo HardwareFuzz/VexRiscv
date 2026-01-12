@@ -1,6 +1,7 @@
 DEBUG?=no
 REGRESSION_PATH?=./
 VEXRISCV_FILE?=../../../../VexRiscv.v
+MAIN_CPP?=main.cpp
 IBUS?=CACHED
 IBUS_TC?=no
 IBUS_DATA_WIDTH?=32
@@ -350,7 +351,7 @@ run: compile
 
 verilate: ${VEXRISCV_FILE}
 	cp ${VEXRISCV_FILE}*.bin . | true
-	verilator -cc  ${VEXRISCV_FILE}  -O3 -LDFLAGS -pthread ${ADDCFLAGS} --gdbbt ${VERILATOR_ARGS} -Wno-UNOPTFLAT -Wno-WIDTH --x-assign unique --exe main.cpp
+	verilator -cc  ${VEXRISCV_FILE}  -O3 -LDFLAGS -pthread ${ADDCFLAGS} --gdbbt ${VERILATOR_ARGS} -Wno-UNOPTFLAT -Wno-WIDTH --x-assign unique --exe ${MAIN_CPP}
  	
 compile: verilate
 	make  -j${THREAD_COUNT} -C obj_dir/ -f VVexRiscv.mk VVexRiscv

@@ -3,10 +3,10 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./build.sh [--coverage|--coverage-light|--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
+Usage: ./build.sh [--coverage|--coverage-light|--no-coverage] [--clean] [--smp|--no-smp] [--help] [-- extra_verilator_args...]
 
 Build Verilator-based VexRiscv simulators that accept an ELF/HEX path.
-- Default builds RV32FD (GenMax) and RV32F (GenMaxRv32F) binaries in build_result/.
+- Default builds RV32FD (GenMax), RV32F (GenMaxRv32F), and SMP 2-core (VexRiscvSmp2Gen) binaries in build_result/.
 - Pass --coverage to build full coverage-enabled binaries (suffix *_cov) with Verilator --coverage.
 - Pass --coverage-light to build lightweight coverage binaries (suffix *_cov_light) with line/user-only coverage.
 - Arguments after "--" are forwarded to Verilator (e.g. -- --compiler clang).
@@ -14,6 +14,7 @@ EOF
 }
 
 COVERAGE_MODE="${COVERAGE_MODE:-none}" # none|full|light
+BUILD_SMP="${BUILD_SMP:-yes}"
 CLEAN=0
 EXTRA_VERILATOR_ARGS=()
 
@@ -23,6 +24,8 @@ while [[ $# -gt 0 ]]; do
         --coverage-light) COVERAGE_MODE="light" ;;
         --no-coverage|-n) COVERAGE_MODE="none" ;;
         --clean) CLEAN=1 ;;
+        --smp) BUILD_SMP="yes" ;;
+        --no-smp) BUILD_SMP="no" ;;
         --help|-h) usage; exit 0 ;;
         --) shift; EXTRA_VERILATOR_ARGS+=("$@"); break ;;
         *) EXTRA_VERILATOR_ARGS+=("$1") ;;
@@ -48,6 +51,7 @@ done
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${ROOT_DIR}/build_result"
 export WITH_RISCV_REF="${WITH_RISCV_REF:-no}"
+SBT_CACHE_DIR="${ROOT_DIR}/.sbt-cache"
 
 BIN_SUFFIX=""
 BUILD_KIND="standard"
@@ -87,8 +91,15 @@ case "$COVERAGE_MODE" in
         ;;
 esac
 
+if [[ -n "$VERILATOR_ARGS_STR" ]]; then
+    VERILATOR_ARGS_STR="${VERILATOR_ARGS_STR} -I${ROOT_DIR}/src/test/cpp/regression"
+else
+    VERILATOR_ARGS_STR="-I${ROOT_DIR}/src/test/cpp/regression"
+fi
+
 OUT_BIN_FD="${OUT_DIR}/vex_rv32_fd${BIN_SUFFIX}"
 OUT_BIN_F="${OUT_DIR}/vex_rv32_f${BIN_SUFFIX}"
+OUT_BIN_SMP="${OUT_DIR}/vex_rv32_smp_2c${BIN_SUFFIX}"
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -102,16 +113,24 @@ if ! command_exists java; then
   exit 1
 fi
 
-# Acquire sbt if missing (sbt-extras lightweight wrapper).
-SBT_CMD="sbt"
-if ! command_exists sbt; then
-  SBT_CMD="${ROOT_DIR}/.sbtw"
+# Prefer the local sbt-extras wrapper so we can pin caches in-repo.
+SBT_CMD="${SBT_CMD:-${ROOT_DIR}/.sbtw}"
+if [[ "${SBT_CMD}" == "${ROOT_DIR}/.sbtw" ]]; then
   if [[ ! -x "${SBT_CMD}" ]]; then
-    echo "[info] sbt not found; downloading sbt-extras wrapper..."
+    echo "[info] downloading sbt-extras wrapper..."
     curl -fsSL https://raw.githubusercontent.com/paulp/sbt-extras/master/sbt > "${SBT_CMD}"
     chmod +x "${SBT_CMD}"
   fi
+else
+  if ! command_exists "${SBT_CMD}"; then
+    echo "Error: sbt command not found: ${SBT_CMD}"
+    exit 1
+  fi
 fi
+
+# Keep sbt caches under the repo to avoid global lock permission issues.
+mkdir -p "${SBT_CACHE_DIR}/boot" "${SBT_CACHE_DIR}/sbt" "${SBT_CACHE_DIR}/ivy2" "${SBT_CACHE_DIR}/staging"
+export SBT_OPTS="${SBT_OPTS:-} -Dsbt.boot.directory=${SBT_CACHE_DIR}/boot -Dsbt.global.base=${SBT_CACHE_DIR}/sbt -Dsbt.ivy.home=${SBT_CACHE_DIR}/ivy2 -Dsbt.global.staging=${SBT_CACHE_DIR}/staging -Duser.home=${ROOT_DIR}"
 
 mkdir -p "${OUT_DIR}"
 if (( CLEAN )); then
@@ -151,9 +170,30 @@ build_variant "RV32FD" "vexriscv.demo.GenMax" yes yes "${OUT_BIN_FD}"
 echo "[3/4] Building RV32F (GenMaxRv32F, RVF only)..."
 build_variant "RV32F" "vexriscv.demo.GenMaxRv32F" yes no "${OUT_BIN_F}"
 
-echo "[4/4] Packaging..."
+if [[ "$BUILD_SMP" == "yes" ]]; then
+    echo "[4/4] Building SMP 2-core (VexRiscvSmp2Gen)..."
+    pushd "${ROOT_DIR}" >/dev/null
+    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen"
+    popd >/dev/null
+
+    pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
+    WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
+    WITH_RISCV_REF="${WITH_RISCV_REF}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
+        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes SUPERVISOR=yes MMU=yes \
+        IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes \
+        TRACE_WITH_TIME=yes LINUX_SOC_SMP=yes MAIN_CPP=main_smp.cpp
+    WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
+    cp -f "obj_dir/VVexRiscv" "${OUT_BIN_SMP}"
+    chmod +x "${OUT_BIN_SMP}"
+    popd >/dev/null
+fi
+
+echo "[5/5] Packaging..."
 echo "Done: ${OUT_BIN_FD}"
 echo "Done: ${OUT_BIN_F}"
+if [[ "$BUILD_SMP" == "yes" ]]; then
+  echo "Done: ${OUT_BIN_SMP}"
+fi
 if [[ "$COVERAGE_MODE" == "full" ]]; then
   echo "Coverage enabled (Verilator --coverage). Use +covfile=<path> when running to override logs/coverage.dat."
 elif [[ "$COVERAGE_MODE" == "light" ]]; then
@@ -169,3 +209,6 @@ echo
 echo "Run example:"
 echo "  ${OUT_BIN_FD} path/to/program.elf   # RV32IMAFD"
 echo "  ${OUT_BIN_F} path/to/program.elf    # RV32IMAF"
+if [[ "$BUILD_SMP" == "yes" ]]; then
+  echo "  ${OUT_BIN_SMP} path/to/program.elf  # SMP 2-core"
+fi

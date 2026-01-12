@@ -13,6 +13,10 @@ lib_managed/
 src_managed/
 project/boot/
 project/plugins/project/
+.coursier/
+.sbt/
+.sbt-cache/
+.home/
 
 # Scala-IDE specific
 .scala_dependencies

@@ -80,7 +80,7 @@ class VexRiscvSmpClusterBase(p : VexRiscvSmpClusterParameter) extends Area with 
   }
 
   val cores = for(cpuId <- 0 until cpuCount) yield new Area{
-    val cpu = VexRiscvBmbGenerator()
+    val cpu = VexRiscvBmbGenerator(s"VexRiscvCore_${cpuId}")
     cpu.config.load(p.cpuConfigs(cpuId))
     interconnect.addConnection(
       cpu.dBus -> List(dBusCoherent.bmb)
