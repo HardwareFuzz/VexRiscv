@@ -7,6 +7,7 @@ import spinal.lib.bus.misc.{AddressMapping, DefaultMapping, SizeMapping}
 import spinal.lib.bus.wishbone.{WishboneConfig, WishboneToBmbGenerator}
 import spinal.lib.generator.GeneratorComponent
 import spinal.lib.sim.SparseMemory
+import vexriscv.demo.GenMemOrder
 import vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen.exposeTime
 import vexriscv.demo.smp.VexRiscvSmpClusterGen.vexRiscvConfig
 import vexriscv.ip.fpu.{FpuCore, FpuParameter}
@@ -129,6 +130,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
   var dTlbSize = 4
   var wishboneForce32b = false
   var exposeTime = false
+  var memorderVariant: Option[GenMemOrder.Variant] = None
   assert(new scopt.OptionParser[Unit]("VexRiscvLitexSmpClusterCmdGen") {
     help("help").text("prints this usage text")
     opt[Unit]  ("coherent-dma") action { (v, c) => coherentDma = true }
@@ -154,9 +156,18 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
     opt[String]("itlb-size") action { (v, c) => iTlbSize = v.toInt }
     opt[String]("dtlb-size") action { (v, c) => dTlbSize = v.toInt }
     opt[String]("expose-time") action { (v, c) => exposeTime = v.toBoolean }
+    opt[String]("memorder") action { (v, c) => memorderVariant = Some(GenMemOrder.Variant.parse(v)) }
   }.parse(args, Unit).nonEmpty)
 
-  val coherency = coherentDma || cpuCount > 1
+  val baseCoherency = coherentDma || cpuCount > 1
+  val memorderWriteAggregation = memorderVariant.map(_.withWriteAggregation)
+  val memorderFenceInvalidate = memorderVariant.map(_.withFence)
+  // Fence variants still need the exclusive signal driven; keep atomics enabled in that case.
+  val memorderAtomic = memorderVariant.map(v => v.withAtomic || v.withFence).getOrElse(true)
+  val coherency = memorderFenceInvalidate match {
+    case Some(fence) => coherentDma || (cpuCount > 1 && fence)
+    case None => baseCoherency
+  }
   def parameter = VexRiscvLitexSmpClusterParameter(
     cluster = VexRiscvSmpClusterParameter(
       cpuConfigs = List.tabulate(cpuCount) { hartId => {
@@ -171,6 +182,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           iCacheWays = iCacheWays,
           dCacheWays = dCacheWays,
           coherency = coherency,
+          atomic = memorderAtomic,
           privilegedDebug = privilegedDebug,
           iBusRelax = true,
           earlyBranch = true,
@@ -181,7 +193,9 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           rvc = rvc,
           injectorStage = rvc,
           iTlbSize = iTlbSize,
-          dTlbSize = dTlbSize
+          dTlbSize = dTlbSize,
+          memorderWriteAggregation = memorderWriteAggregation,
+          memorderFenceInvalidate = memorderFenceInvalidate
         )
         if(aesInstruction) c.add(new AesPlugin)
         c

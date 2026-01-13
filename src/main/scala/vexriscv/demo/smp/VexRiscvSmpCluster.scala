@@ -231,6 +231,8 @@ object VexRiscvSmpClusterGen {
                      loadStoreWidth : Int = 32,
                      coherency : Boolean = true,
                      atomic : Boolean = true,
+                     memorderWriteAggregation : Option[Boolean] = None,
+                     memorderFenceInvalidate : Option[Boolean] = None,
                      iCacheSize : Int = 8192,
                      dCacheSize : Int = 8192,
                      iCacheWays : Int = 2,
@@ -304,6 +306,7 @@ object VexRiscvSmpClusterGen {
         withPrivilegedDebug = privilegedDebug
       )
     }
+    val cacheCoherency = memorderFenceInvalidate.getOrElse(coherency)
     val config = VexRiscvConfig(
       plugins = List(
         if(withMmu)new MmuPlugin(
@@ -367,9 +370,9 @@ object VexRiscvSmpClusterGen {
             catchUnaligned    = true,
             withLrSc = atomic,
             withAmo = atomic,
-            withExclusive = coherency,
-            withInvalidate = coherency,
-            withWriteAggregation = dBusWidth > 32
+            withExclusive = cacheCoherency,
+            withInvalidate = cacheCoherency,
+            withWriteAggregation = memorderWriteAggregation.getOrElse(dBusWidth > 32)
           ),
           memoryTranslatorPortConfig = MmuPortConfig(
             portTlbSize = dTlbSize,
