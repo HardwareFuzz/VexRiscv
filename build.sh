@@ -3,10 +3,11 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./build.sh [--coverage|--coverage-light|--no-coverage] [--clean] [--smp|--no-smp] [--help] [-- extra_verilator_args...]
+Usage: ./build.sh [--coverage|--coverage-light|--no-coverage] [--memorder <cache|store-buffer|fence|atomic>] [--clean] [--smp|--no-smp] [--help] [-- extra_verilator_args...]
 
 Build Verilator-based VexRiscv simulators that accept an ELF/HEX path.
 - Default builds RV32FD (GenMax), RV32F (GenMaxRv32F), and SMP 2-core (VexRiscvSmp2Gen) binaries in build_result/.
+- Pass --memorder <name> to build a GenMemOrder variant (cache/store-buffer/fence/atomic) in build_result/.
 - Pass --coverage to build full coverage-enabled binaries (suffix *_cov) with Verilator --coverage.
 - Pass --coverage-light to build lightweight coverage binaries (suffix *_cov_light) with line/user-only coverage.
 - Arguments after "--" are forwarded to Verilator (e.g. -- --compiler clang).
@@ -16,6 +17,7 @@ EOF
 COVERAGE_MODE="${COVERAGE_MODE:-none}" # none|full|light
 BUILD_SMP="${BUILD_SMP:-yes}"
 CLEAN=0
+MEMORDER_VARIANT="${MEMORDER_VARIANT:-}"
 EXTRA_VERILATOR_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -23,6 +25,15 @@ while [[ $# -gt 0 ]]; do
         --coverage|-c) COVERAGE_MODE="full" ;;
         --coverage-light) COVERAGE_MODE="light" ;;
         --no-coverage|-n) COVERAGE_MODE="none" ;;
+        --memorder)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --memorder requires a variant name."
+                exit 1
+            fi
+            MEMORDER_VARIANT="$2"
+            shift
+            ;;
+        --memorder=*) MEMORDER_VARIANT="${1#*=}" ;;
         --clean) CLEAN=1 ;;
         --smp) BUILD_SMP="yes" ;;
         --no-smp) BUILD_SMP="no" ;;
@@ -37,6 +48,7 @@ done
 # Output binaries:
 #   - build_result/vex_rv32_fd[[_cov|_cov_light]] : RV32IMAFD + S-mode + MMU (GenMax)
 #   - build_result/vex_rv32_f[[_cov|_cov_light]]  : RV32IMAF  + S-mode + MMU (GenMaxRv32F)
+#   - build_result/vex_rv32_memorder_<name>[[_cov|_cov_light]] : MemOrder variant (GenMemOrder, optional)
 #
 # Requirements:
 # - Java (for Scala codegen)
@@ -100,10 +112,36 @@ fi
 OUT_BIN_FD="${OUT_DIR}/vex_rv32_fd${BIN_SUFFIX}"
 OUT_BIN_F="${OUT_DIR}/vex_rv32_f${BIN_SUFFIX}"
 OUT_BIN_SMP="${OUT_DIR}/vex_rv32_smp_2c${BIN_SUFFIX}"
+OUT_BIN_MEMORDER=""
+
+if [[ -n "$MEMORDER_VARIANT" ]]; then
+  MEMORDER_VARIANT="${MEMORDER_VARIANT,,}"
+  case "$MEMORDER_VARIANT" in
+    cache) ;;
+    store-buffer|store_buffer|storebuffer) MEMORDER_VARIANT="store-buffer" ;;
+    fence) ;;
+    atomic) ;;
+    *)
+      echo "Error: unknown memorder variant: ${MEMORDER_VARIANT}"
+      exit 1
+      ;;
+  esac
+  OUT_BIN_MEMORDER="${OUT_DIR}/vex_rv32_memorder_${MEMORDER_VARIANT}${BIN_SUFFIX}"
+fi
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-echo "[1/4] Checking prerequisites..."
+TOTAL_STEPS=4
+if [[ "$BUILD_SMP" == "yes" ]]; then
+  TOTAL_STEPS=$((TOTAL_STEPS + 1))
+fi
+if [[ -n "$MEMORDER_VARIANT" ]]; then
+  TOTAL_STEPS=$((TOTAL_STEPS + 1))
+fi
+STEP=1
+
+echo "[${STEP}/${TOTAL_STEPS}] Checking prerequisites..."
+STEP=$((STEP + 1))
 if ! command_exists verilator; then
   echo "Error: verilator not found in PATH."
   exit 1
@@ -138,8 +176,16 @@ if (( CLEAN )); then
   rm -f "${OUT_DIR}/vex_rv32_fd" "${OUT_DIR}/vex_rv32_f" \
         "${OUT_DIR}/vex_rv32_fd_cov" "${OUT_DIR}/vex_rv32_f_cov" \
         "${OUT_DIR}/vex_rv32_fd_cov_light" "${OUT_DIR}/vex_rv32_f_cov_light"
+  if [[ -n "$MEMORDER_VARIANT" ]]; then
+    rm -f "${OUT_DIR}/vex_rv32_memorder_${MEMORDER_VARIANT}" \
+          "${OUT_DIR}/vex_rv32_memorder_${MEMORDER_VARIANT}_cov" \
+          "${OUT_DIR}/vex_rv32_memorder_${MEMORDER_VARIANT}_cov_light"
+  fi
 else
   rm -f "${OUT_BIN_FD}" "${OUT_BIN_F}"
+  if [[ -n "$OUT_BIN_MEMORDER" ]]; then
+    rm -f "${OUT_BIN_MEMORDER}"
+  fi
 fi
 
 build_variant() {
@@ -148,6 +194,7 @@ build_variant() {
     local rvf="$3"
     local rvd="$4"
     local out_bin="$5"
+    local extra_make_args=("${@:6}")
 
     echo "[build] ${name} (${BUILD_KIND}) -> ${out_bin}"
     pushd "${ROOT_DIR}" >/dev/null
@@ -157,21 +204,72 @@ build_variant() {
     pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
     WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
     WITH_RISCV_REF="${WITH_RISCV_REF}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
-        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF="${rvf}" RVD="${rvd}" SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes
+        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF="${rvf}" RVD="${rvd}" SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes "${extra_make_args[@]}"
     WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
     cp -f "obj_dir/VVexRiscv" "${out_bin}"
     chmod +x "${out_bin}"
     popd >/dev/null
 }
 
-echo "[2/4] Building RV32FD (GenMax, RVF+RVD)..."
+build_memorder_variant() {
+    local variant="$1"
+    local out_bin="$2"
+    local lrsc="no"
+    local amo="no"
+    local dbus_exclusive="no"
+    local dbus_invalidate="no"
+
+    case "$variant" in
+      cache) ;;
+      store-buffer) ;;
+      fence)
+        dbus_invalidate="yes"
+        ;;
+      atomic)
+        dbus_exclusive="yes"
+        dbus_invalidate="yes"
+        lrsc="yes"
+        amo="yes"
+        ;;
+    esac
+
+    local make_args=(
+      "COMPRESSED=no"
+      "LRSC=${lrsc}"
+      "AMO=${amo}"
+      "MMU=no"
+      "SUPERVISOR=no"
+      "IBUS_DATA_WIDTH=32"
+      "DBUS_LOAD_DATA_WIDTH=32"
+      "DBUS_STORE_DATA_WIDTH=32"
+    )
+    if [[ "$dbus_exclusive" == "yes" ]]; then
+      make_args+=("DBUS_EXCLUSIVE=yes")
+    fi
+    if [[ "$dbus_invalidate" == "yes" ]]; then
+      make_args+=("DBUS_INVALIDATE=yes")
+    fi
+
+    build_variant "MemOrder (${variant})" "vexriscv.demo.GenMemOrder ${variant}" no no "${out_bin}" "${make_args[@]}"
+}
+
+echo "[${STEP}/${TOTAL_STEPS}] Building RV32FD (GenMax, RVF+RVD)..."
+STEP=$((STEP + 1))
 build_variant "RV32FD" "vexriscv.demo.GenMax" yes yes "${OUT_BIN_FD}"
 
-echo "[3/4] Building RV32F (GenMaxRv32F, RVF only)..."
+echo "[${STEP}/${TOTAL_STEPS}] Building RV32F (GenMaxRv32F, RVF only)..."
+STEP=$((STEP + 1))
 build_variant "RV32F" "vexriscv.demo.GenMaxRv32F" yes no "${OUT_BIN_F}"
 
+if [[ -n "$MEMORDER_VARIANT" ]]; then
+    echo "[${STEP}/${TOTAL_STEPS}] Building memorder (${MEMORDER_VARIANT})..."
+    STEP=$((STEP + 1))
+    build_memorder_variant "${MEMORDER_VARIANT}" "${OUT_BIN_MEMORDER}"
+fi
+
 if [[ "$BUILD_SMP" == "yes" ]]; then
-    echo "[4/4] Building SMP 2-core (VexRiscvSmp2Gen)..."
+    echo "[${STEP}/${TOTAL_STEPS}] Building SMP 2-core (VexRiscvSmp2Gen)..."
+    STEP=$((STEP + 1))
     pushd "${ROOT_DIR}" >/dev/null
     "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen"
     popd >/dev/null
@@ -188,9 +286,12 @@ if [[ "$BUILD_SMP" == "yes" ]]; then
     popd >/dev/null
 fi
 
-echo "[5/5] Packaging..."
+echo "[${STEP}/${TOTAL_STEPS}] Packaging..."
 echo "Done: ${OUT_BIN_FD}"
 echo "Done: ${OUT_BIN_F}"
+if [[ -n "$OUT_BIN_MEMORDER" ]]; then
+  echo "Done: ${OUT_BIN_MEMORDER}"
+fi
 if [[ "$BUILD_SMP" == "yes" ]]; then
   echo "Done: ${OUT_BIN_SMP}"
 fi
