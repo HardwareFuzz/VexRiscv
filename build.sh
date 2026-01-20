@@ -248,7 +248,7 @@ build_variant() {
     pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
     WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
     WITH_RISCV_REF="${WITH_RISCV_REF}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
-        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF="${rvf}" RVD="${rvd}" SUPERVISOR=yes MMU=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes "${extra_make_args[@]}"
+        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes RVF="${rvf}" RVD="${rvd}" SUPERVISOR=yes MMU=yes CSR=yes IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes TRACE_WITH_TIME=yes "${extra_make_args[@]}"
     WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
     cp -f "obj_dir/VVexRiscv" "${out_bin}"
     chmod +x "${out_bin}"
@@ -331,6 +331,7 @@ build_smp_memorder_variant() {
       "TRACE_ACCESS=yes"
       "TRACE_WITH_TIME=yes"
       "LINUX_SOC_SMP=yes"
+      "CSR=yes"
       "MAIN_CPP=main_smp.cpp"
     )
     if [[ "$dbus_exclusive" == "yes" ]]; then
@@ -341,13 +342,13 @@ build_smp_memorder_variant() {
     fi
 
     pushd "${ROOT_DIR}" >/dev/null
-    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --memorder ${variant} --ibus-width 32 --dbus-width 32"
+    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --memorder ${variant} --ibus-width 32 --dbus-width 32 --csr-full"
     popd >/dev/null
 
     pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
     WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
     WITH_RISCV_REF="${WITH_RISCV_REF}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
-        make verilate RUN_HEX="" "${make_args[@]}"
+        make verilate RUN_HEX="" CSR=yes "${make_args[@]}"
     WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
     cp -f "obj_dir/VVexRiscv" "${out_bin}"
     chmod +x "${out_bin}"
@@ -372,13 +373,13 @@ if [[ "$BUILD_SMP" == "yes" ]]; then
     echo "[${STEP}/${TOTAL_STEPS}] Building SMP 2-core (VexRiscvSmp2Gen)..."
     STEP=$((STEP + 1))
     pushd "${ROOT_DIR}" >/dev/null
-    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen"
+    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --csr-full"
     popd >/dev/null
 
     pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
     WITH_RISCV_REF="${WITH_RISCV_REF}" make clean
     WITH_RISCV_REF="${WITH_RISCV_REF}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
-        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes SUPERVISOR=yes MMU=yes \
+        make verilate RUN_HEX="" COMPRESSED=yes LRSC=yes AMO=yes SUPERVISOR=yes MMU=yes CSR=yes \
         IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 TRACE_ACCESS=yes \
         TRACE_WITH_TIME=yes LINUX_SOC_SMP=yes MAIN_CPP=main_smp.cpp
     WITH_RISCV_REF="${WITH_RISCV_REF}" make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv

@@ -154,7 +154,8 @@ object GenMemOrder extends App {
       ),
       new MulPlugin,
       new DivPlugin,
-      new CsrPlugin(CsrPluginConfig.small),
+      new CsrPlugin(CsrPluginConfig.all(0x80000020l)),
+      new ExternalInterruptArrayPlugin(2),
       new DebugPlugin(ClockDomain.current.clone(reset = Bool().setName("debugReset"))),
       new BranchPlugin(
         earlyBranch = false,

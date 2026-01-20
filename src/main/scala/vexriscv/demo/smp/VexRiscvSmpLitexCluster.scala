@@ -131,6 +131,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
   var wishboneForce32b = false
   var exposeTime = false
   var memorderVariant: Option[GenMemOrder.Variant] = None
+  var csrFull = false
   assert(new scopt.OptionParser[Unit]("VexRiscvLitexSmpClusterCmdGen") {
     help("help").text("prints this usage text")
     opt[Unit]  ("coherent-dma") action { (v, c) => coherentDma = true }
@@ -157,6 +158,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
     opt[String]("dtlb-size") action { (v, c) => dTlbSize = v.toInt }
     opt[String]("expose-time") action { (v, c) => exposeTime = v.toBoolean }
     opt[String]("memorder") action { (v, c) => memorderVariant = Some(GenMemOrder.Variant.parse(v)) }
+    opt[Unit]("csr-full") action { (v, c) => csrFull = true }
   }.parse(args, Unit).nonEmpty)
 
   val baseCoherency = coherentDma || cpuCount > 1
@@ -195,7 +197,8 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           iTlbSize = iTlbSize,
           dTlbSize = dTlbSize,
           memorderWriteAggregation = memorderWriteAggregation,
-          memorderFenceInvalidate = memorderFenceInvalidate
+          memorderFenceInvalidate = memorderFenceInvalidate,
+          csrFull = csrFull
         )
         if(aesInstruction) c.add(new AesPlugin)
         c
