@@ -164,21 +164,26 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
   val baseCoherency = coherentDma || cpuCount > 1
   val memorderWriteAggregation = memorderVariant.map(_.withWriteAggregation)
   val memorderFenceInvalidate = memorderVariant.map(_.withFence)
-  // Fence variants still need the exclusive signal driven; keep atomics enabled in that case.
-  val memorderAtomic = memorderVariant.map(v => v.withAtomic || v.withFence).getOrElse(true)
-  val coherency = memorderFenceInvalidate match {
-    case Some(fence) => coherentDma || (cpuCount > 1 && fence)
-    case None => baseCoherency
-  }
+  // riscv_fuzz_test SMP harness relies on AMO-based barriers across all memorder variants.
+  // Keep atomics enabled unconditionally to avoid illegal-instruction traps on amoadd/lr/sc.
+  val memorderAtomic = true
+  // For fuzzing, keep cache coherency enabled whenever cpuCount > 1.
+  // Disabling coherency makes AMO-based barriers unreliable (hart1 may never observe start_flag).
+  val coherency = baseCoherency
   def parameter = VexRiscvLitexSmpClusterParameter(
     cluster = VexRiscvSmpClusterParameter(
       cpuConfigs = List.tabulate(cpuCount) { hartId => {
-        val c = vexRiscvConfig(
-          hartId = hartId,
-          ioRange = address => address.msb,
-          resetVector = 0,
-          iBusWidth = iBusWidth,
-          dBusWidth = dBusWidth,
+         val c = vexRiscvConfig(
+           hartId = hartId,
+           // Keep a simple memory map for fuzzing:
+           // - DRAM at 0x8000_0000...
+           // - MMIO at 0xFxxx_xxxx
+            // IO decode: treat 0xFxxx_xxxx (byte addressing) as MMIO.
+            // Some bridges expose word addresses; in that case the byte top-nibble is at address(29 downto 26).
+            ioRange = address => (address(31 downto 28) === 0xF) || (address(29 downto 26) === 0xF),
+           resetVector = 0x80000000l,
+           iBusWidth = iBusWidth,
+           dBusWidth = dBusWidth,
           iCacheSize = iCacheSize,
           dCacheSize = dCacheSize,
           iCacheWays = iCacheWays,
@@ -196,10 +201,11 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           injectorStage = rvc,
           iTlbSize = iTlbSize,
           dTlbSize = dTlbSize,
-          memorderWriteAggregation = memorderWriteAggregation,
-          memorderFenceInvalidate = memorderFenceInvalidate,
-          csrFull = csrFull
-        )
+           memorderWriteAggregation = memorderWriteAggregation,
+           // Don't let memorder variants disable coherency in SMP fuzz runs.
+           memorderFenceInvalidate = None,
+           csrFull = csrFull
+         )
         if(aesInstruction) c.add(new AesPlugin)
         c
       }},
@@ -211,13 +217,13 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
       privilegedDebug = privilegedDebug,
       hardwareBreakpoints = hardwareBreakpoints
     ),
-    liteDram = LiteDramNativeParameter(addressWidth = 32, dataWidth = liteDramWidth),
-    liteDramMapping = SizeMapping(0x40000000l, 0x40000000l),
-    coherentDma = coherentDma,
-    wishboneMemory = wishboneMemory,
-    cpuPerFpu = cpuPerFpu,
-    exposeTime = exposeTime
-  )
+     liteDram = LiteDramNativeParameter(addressWidth = 32, dataWidth = liteDramWidth),
+     liteDramMapping = SizeMapping(0x80000000l, 0x70000000l),
+     coherentDma = coherentDma,
+     wishboneMemory = wishboneMemory,
+     cpuPerFpu = cpuPerFpu,
+     exposeTime = exposeTime
+   )
 
   def dutGen = {
     val toplevel = new Component {

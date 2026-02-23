@@ -342,7 +342,7 @@ build_smp_memorder_variant() {
     fi
 
     pushd "${ROOT_DIR}" >/dev/null
-    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --memorder ${variant} --ibus-width 32 --dbus-width 32 --csr-full"
+    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --memorder ${variant} --ibus-width 32 --dbus-width 32 --rvc true --csr-full"
     popd >/dev/null
 
     pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
@@ -373,7 +373,7 @@ if [[ "$BUILD_SMP" == "yes" ]]; then
     echo "[${STEP}/${TOTAL_STEPS}] Building SMP 2-core (VexRiscvSmp2Gen)..."
     STEP=$((STEP + 1))
     pushd "${ROOT_DIR}" >/dev/null
-    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --csr-full"
+    "${SBT_CMD}" "runMain vexriscv.demo.smp.VexRiscvSmp2Gen --rvc true --csr-full"
     popd >/dev/null
 
     pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null

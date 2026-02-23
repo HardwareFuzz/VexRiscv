@@ -4331,6 +4331,20 @@ int main(int argc, char **argv, char **env) {
 #ifdef LINUX_SOC_SMP
     {
 
+        // When running the Verilator binary as a generic ELF/HEX runner (our fuzz harness
+        // passes an image path as argv[1]), do NOT take the Linux boot path. Fall through
+        // to the standard RUN_HEX/DEBUG_PLUGIN_EXTERNAL flow below.
+        int imageArgIdx = -1;
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i][0] == '+') continue;
+            imageArgIdx = i;
+            break;
+        }
+        if (imageArgIdx != -1) {
+            // A baremetal image was provided.
+            // Skip LinuxSocSmp boot and let the normal runner below handle it.
+        } else {
+
 	    LinuxSocSmp soc("linuxSmp");
 	    #ifndef DEBUG_PLUGIN_EXTERNAL
 	    soc.withRiscvRef();
@@ -4346,6 +4360,7 @@ int main(int argc, char **argv, char **env) {
 //		soc.run((496300000l + 2000000) / 2);
 //		soc.run(438700000l/2);
         return -1;
+        }
     }
 #endif
 
