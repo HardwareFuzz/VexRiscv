@@ -7,6 +7,9 @@
 // - Emit run.memTrace lines (PC=0) so perf extraction works for both harts.
 
 #include "VVexRiscv.h"
+#include "VVexRiscv_VexRiscv.h"
+#include "VVexRiscv_VexRiscvCore_0.h"
+#include "VVexRiscv_VexRiscvCore_1.h"
 #include "verilated.h"
 
 #include <cstdint>
@@ -136,7 +139,7 @@ static void unpack_bytes_from_u32_words(const uint32_t words[4], uint8_t bytes[1
     }
 }
 
-static void log_mem_write_groups(FILE *f, uint64_t time, uint32_t base, const uint8_t bytes[16], uint16_t mask) {
+static void log_mem_write_groups(FILE *f, uint64_t time, uint32_t pc, uint32_t base, const uint8_t bytes[16], uint16_t mask) {
     // Group contiguous enabled bytes and emit one line per group.
     int i = 0;
     while (i < 16) {
@@ -158,9 +161,45 @@ static void log_mem_write_groups(FILE *f, uint64_t time, uint32_t base, const ui
         }
         std::fprintf(
             f,
-            "%llu PC 0 : MEM[0x%08x] <= %d bytes : 0x%s\n",
+            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s\n",
             static_cast<unsigned long long>(time),
+            static_cast<unsigned int>(pc),
             static_cast<unsigned int>(base + static_cast<uint32_t>(start)),
+            len,
+            hex.c_str());
+    }
+}
+
+static void log_mem_write_masked32(FILE *f, uint64_t time, uint32_t pc, uint32_t addr, uint32_t data, uint8_t mask) {
+    uint8_t bytes[4];
+    bytes[0] = static_cast<uint8_t>((data >> 0) & 0xFF);
+    bytes[1] = static_cast<uint8_t>((data >> 8) & 0xFF);
+    bytes[2] = static_cast<uint8_t>((data >> 16) & 0xFF);
+    bytes[3] = static_cast<uint8_t>((data >> 24) & 0xFF);
+
+    int i = 0;
+    while (i < 4) {
+        while (i < 4 && ((mask >> i) & 1u) == 0) i++;
+        if (i >= 4) break;
+        int start = i;
+        int len = 0;
+        while (i < 4 && ((mask >> i) & 1u) != 0) {
+            len++;
+            i++;
+        }
+        std::string hex;
+        hex.reserve(static_cast<size_t>(len) * 2);
+        for (int j = len - 1; j >= 0; j--) {
+            char buf[3];
+            std::snprintf(buf, sizeof(buf), "%02x", bytes[start + j]);
+            hex += buf;
+        }
+        std::fprintf(
+            f,
+            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s\n",
+            static_cast<unsigned long long>(time),
+            static_cast<unsigned int>(pc),
+            static_cast<unsigned int>(addr + static_cast<uint32_t>(start)),
             len,
             hex.c_str());
     }
@@ -210,6 +249,12 @@ int main(int argc, char **argv) {
     FILE *mem_trace = std::fopen("run.memTrace", "w");
     if (!mem_trace) {
         std::perror("failed to open run.memTrace");
+        return 2;
+    }
+
+    FILE *reg_trace = std::fopen("run.regTrace", "w");
+    if (!reg_trace) {
+        std::perror("failed to open run.regTrace");
         return 2;
     }
 
@@ -297,6 +342,10 @@ int main(int argc, char **argv) {
     uint64_t rdata_i_count = 0;
     uint64_t rdata_d_count = 0;
 
+    // Per-core store edge tracking (memory stage can be held while back-pressured).
+    uint8_t cpu0_store_prev = 0;
+    uint8_t cpu1_store_prev = 0;
+
     // Extra visibility: capture if data/periph ever toggles.
     uint64_t d_cmd_seen = 0;
     uint64_t d_wdata_seen = 0;
@@ -377,6 +426,92 @@ int main(int argc, char **argv) {
         top->debugCd_external_clk = 1;
         top->eval();
         log_bus_phase("H", cycle);
+
+        // Architectural traces (per-core) at posedge.
+        // These are required by riscv_fuzz_test for per-instruction diff analysis.
+        auto *soc = top->VexRiscv;
+        auto *cpu0 = soc->cores_0_cpu_logic_cpu;
+        auto *cpu1 = soc->cores_1_cpu_logic_cpu;
+
+        // Register writes
+        if (cpu0->lastStageIsFiring && cpu0->lastStageRegFileWrite_valid && cpu0->lastStageRegFileWrite_payload_address != 0) {
+            std::fprintf(
+                reg_trace,
+                "%llu PC %08x : reg[%2u] = %08x\n",
+                static_cast<unsigned long long>(cycle),
+                static_cast<unsigned int>(cpu0->lastStagePc),
+                static_cast<unsigned int>(cpu0->lastStageRegFileWrite_payload_address),
+                static_cast<unsigned int>(cpu0->lastStageRegFileWrite_payload_data));
+        }
+        if (cpu1->lastStageIsFiring && cpu1->lastStageRegFileWrite_valid && cpu1->lastStageRegFileWrite_payload_address != 0) {
+            std::fprintf(
+                reg_trace,
+                "%llu PC %08x : reg[%2u] = %08x\n",
+                static_cast<unsigned long long>(cycle),
+                static_cast<unsigned int>(cpu1->lastStagePc),
+                static_cast<unsigned int>(cpu1->lastStageRegFileWrite_payload_address),
+                static_cast<unsigned int>(cpu1->lastStageRegFileWrite_payload_data));
+        }
+
+        // Exceptions
+        if (cpu0->CsrPlugin_hadException) {
+            std::fprintf(
+                log_trace,
+                "EXC pc=0x%08x cause=%u\n",
+                static_cast<unsigned int>(cpu0->lastStagePc),
+                static_cast<unsigned int>(cpu0->CsrPlugin_trapCause));
+        }
+        if (cpu1->CsrPlugin_hadException) {
+            std::fprintf(
+                log_trace,
+                "EXC pc=0x%08x cause=%u\n",
+                static_cast<unsigned int>(cpu1->lastStagePc),
+                static_cast<unsigned int>(cpu1->CsrPlugin_trapCause));
+        }
+
+        // Memory writes (architectural stores) from the memory stage pipeline regs.
+        // This avoids relying on internal dBus wiring which can be hidden behind cache/arb wrappers.
+        auto log_store = [&](auto *cpu, uint8_t &prev) {
+            const uint8_t is_store = (cpu->__PVT__memory_arbitration_isValid && cpu->__PVT__execute_to_memory_MEMORY_ENABLE && cpu->__PVT__execute_to_memory_MEMORY_WR) ? 1 : 0;
+            if (is_store && !prev) {
+                const uint32_t pc = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_PC);
+                const uint32_t insn = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_INSTRUCTION);
+                const uint32_t addr = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_VIRTUAL_ADDRESS);
+                const uint32_t store_data = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_STORE_DATA_RF);
+
+                const uint32_t opcode = insn & 0x7f;
+                const uint32_t funct3 = (insn >> 12) & 0x7;
+
+                if (opcode == 0x23) { // STORE
+                    const uint32_t base = addr & ~3u;
+                    const uint32_t byte_off = addr & 3u;
+                    uint8_t mask = 0;
+                    uint32_t data_word = 0;
+                    if (funct3 == 0x0) { // SB
+                        if (byte_off < 4) {
+                            mask = static_cast<uint8_t>(1u << byte_off);
+                            data_word = (store_data & 0xFFu) << (8u * byte_off);
+                        }
+                    } else if (funct3 == 0x1) { // SH
+                        if (byte_off <= 2) {
+                            mask = static_cast<uint8_t>(0x3u << byte_off);
+                            data_word = (store_data & 0xFFFFu) << (8u * byte_off);
+                        }
+                    } else if (funct3 == 0x2) { // SW
+                        if (byte_off == 0) {
+                            mask = 0xFu;
+                            data_word = store_data;
+                        }
+                    }
+                    if (mask != 0) {
+                        log_mem_write_masked32(mem_trace, cycle, pc, base, data_word, mask);
+                    }
+                }
+            }
+            prev = is_store;
+        };
+        log_store(cpu0, cpu0_store_prev);
+        log_store(cpu1, cpu1_store_prev);
 
         // Consume read data if the DUT is ready.
         if (top->iBridge_dram_rdata_valid) {
@@ -501,7 +636,7 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < 16; i++) {
                     if ((mask >> i) & 1u) mem[addr + static_cast<uint32_t>(i)] = bytes[i];
                 }
-                log_mem_write_groups(mem_trace, cycle, addr, bytes, mask);
+                // Keep functional memory updates; trace architectural stores via per-core dBus.
             }
         }
 
@@ -553,7 +688,7 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < 16; i++) {
                     if ((mask >> i) & 1u) mem[addr + static_cast<uint32_t>(i)] = bytes[i];
                 }
-                log_mem_write_groups(mem_trace, cycle, addr, bytes, mask);
+                // Keep functional memory updates; trace architectural stores via per-core dBus.
             }
         }
 
@@ -579,6 +714,9 @@ int main(int argc, char **argv) {
 
     std::fflush(mem_trace);
     std::fclose(mem_trace);
+
+    std::fflush(reg_trace);
+    std::fclose(reg_trace);
 
     std::fflush(log_trace);
     std::fclose(log_trace);
