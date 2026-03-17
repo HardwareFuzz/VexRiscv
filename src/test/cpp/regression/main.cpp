@@ -1,10 +1,14 @@
 #include "VVexRiscv.h"
 #include "VVexRiscv_VexRiscv.h"
+#if defined(RVF) || defined(RVD)
+#include "VVexRiscv_FpuCore.h"
+#endif
 #ifdef REF
 #include "VVexRiscv_RiscvCore.h"
 #endif
 #include "verilated.h"
 #include "verilated_fst_c.h"
+#include "verilated_cov.h"
 #include <stdio.h>
 #include <iostream>
 #include <stdlib.h>
@@ -19,15 +23,35 @@
 #include <queue>
 #include <time.h>
 #include "encoding.h"
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #define VL_RANDOM_I_WIDTH(w) (VL_RANDOM_I() & (1l << w)-1l)
 
+#ifdef LINUX_SOC_SMP
+#define VEX_CPU (top->VexRiscv->cores_0_cpu_logic_cpu)
+#else
+#define VEX_CPU (top->VexRiscv)
+#endif
+
 using namespace std;
+
+#if VM_COVERAGE
+static std::string g_cov_path;
+
+static void write_coverage_dat() {
+	if (g_cov_path.empty()) return;
+	Verilated::threadContextp()->coveragep()->write(g_cov_path.c_str());
+	printf("  Coverage: %s\n", g_cov_path.c_str());
+}
+#endif
 
 struct timespec timer_get(){
     struct timespec start_time;
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
-    return start_time;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
+	return start_time;
 }
 
 class Memory{
@@ -876,7 +900,7 @@ public:
                 #ifdef RVD
                 if(size > 8) ilegalInstruction();
                 #else
-                if(format > 4) ilegalInstruction();
+				if(size > 4) ilegalInstruction();
                 #endif
                 auto commit = fpuCommit.front();  fpuCommit.pop();
                 fpuCompletionTockens += 1;
@@ -907,7 +931,7 @@ public:
                 #ifdef RVD
                 if(size > 8) ilegalInstruction();
                 #else
-                if(format > 4) ilegalInstruction();
+				if(size > 4) ilegalInstruction();
                 #endif
 
                 auto rsp = fpuRsp.front(); fpuRsp.pop();
@@ -1323,7 +1347,16 @@ public:
 	ofstream regTraces;
 	ofstream memTraces;
 	ofstream logTraces;
-	ofstream debugLog;
+	ofstream fregTraces;
+
+#ifdef RVF
+	struct FpuIssueInfo {
+		uint32_t pc;
+		uint8_t rd;
+		uint8_t opcode;
+	};
+	std::vector<FpuIssueInfo> fpuPending;
+#endif
 
 	struct timespec start_time;
 
@@ -1477,7 +1510,7 @@ public:
 			memTraces.open (name + ".memTrace");
 		#endif
 		logTraces.open (name + ".logTrace");
-		debugLog.open (name + ".debugTrace");
+		fregTraces.open(name + ".fregTrace");
 		fillSimELements();
 		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
 	}
@@ -1677,23 +1710,23 @@ public:
 
         //Sync register file initial content
         for(int i = 1;i < 32;i++){
-            riscvRef.regs[i] = top->VexRiscv->RegFilePlugin_regFile[i];
+            riscvRef.regs[i] = VEX_CPU->RegFilePlugin_regFile[i];
         }
 		resetDone = true;
 
 		#ifdef  REF
-		if(bootPc != -1) top->VexRiscv->core->prefetch_pc = bootPc;
+		if(bootPc != -1) VEX_CPU->core->prefetch_pc = bootPc;
 		#else
 		if(bootPc != -1) {
 		    #if defined(IBUS_SIMPLE) || defined(IBUS_SIMPLE_WISHBONE) || defined(IBUS_SIMPLE_AHBLITE3)
-                top->VexRiscv->IBusSimplePlugin_fetchPc_pcReg = bootPc;
+                VEX_CPU->IBusSimplePlugin_fetchPc_pcReg = bootPc;
                 #ifdef COMPRESSED
-                top->VexRiscv->IBusSimplePlugin_decodePc_pcReg = bootPc;
+                VEX_CPU->IBusSimplePlugin_decodePc_pcReg = bootPc;
                 #endif
             #else
-                top->VexRiscv->IBusCachedPlugin_fetchPc_pcReg = bootPc;
+                VEX_CPU->IBusCachedPlugin_fetchPc_pcReg = bootPc;
                 #ifdef COMPRESSED
-                top->VexRiscv->IBusCachedPlugin_decodePc_pcReg = bootPc;
+                VEX_CPU->IBusCachedPlugin_decodePc_pcReg = bootPc;
                 #endif
             #endif
 		}
@@ -1720,7 +1753,7 @@ public:
                 #ifndef MTIME_INSTR_FACTOR
                 mTime = i/2;
                 #else
-				mTime += top->VexRiscv->lastStageIsFiring*MTIME_INSTR_FACTOR;
+				mTime += VEX_CPU->lastStageIsFiring*MTIME_INSTR_FACTOR;
                 #endif
 				#endif
 				#ifdef TIMER_INTERRUPT
@@ -1764,44 +1797,86 @@ public:
                         riscvRef.ipInput |= top->externalInterruptS << 9;
     #endif
 
-                        riscvRef.liveness(top->VexRiscv->CsrPlugin_inWfi);
-                        if(top->VexRiscv->CsrPlugin_interruptJump){
-                            if(riscvRefEnable) riscvRef.trap(true, top->VexRiscv->CsrPlugin_interrupt_code);
+                        riscvRef.liveness(VEX_CPU->CsrPlugin_inWfi);
+                        if(VEX_CPU->CsrPlugin_interruptJump){
+                            if(riscvRefEnable) riscvRef.trap(true, VEX_CPU->CsrPlugin_interrupt_code);
                         }
                     }
 				#endif
 
-                #ifdef RVF
-                if(riscvRefEnable) {
-                    if(top->VexRiscv->writeBack_FpuPlugin_commit_valid && top->VexRiscv->writeBack_FpuPlugin_commit_ready && top->VexRiscv->writeBack_FpuPlugin_commit_payload_write){
-                        FpuCommit c;
-                        c.value = top->VexRiscv->writeBack_FpuPlugin_commit_payload_value;
-                        riscvRef.fpuCommit.push(c);
-                    }
+				#ifdef RVF
+				// Capture DUT FPU commit stream for the golden model and track
+				// architectural PCs for FP register writes.
+				if(VEX_CPU->writeBack_FpuPlugin_commit_valid &&
+				   VEX_CPU->writeBack_FpuPlugin_commit_ready &&
+				   VEX_CPU->writeBack_FpuPlugin_commit_payload_write){
 
-                    if(top->VexRiscv->FpuPlugin_port_rsp_valid && top->VexRiscv->FpuPlugin_port_rsp_ready && top->VexRiscv->lastStageIsFiring){
+					if(riscvRefEnable){
+						FpuCommit c;
+						c.value = VEX_CPU->writeBack_FpuPlugin_commit_payload_value;
+						riscvRef.fpuCommit.push(c);
+					}
+
+					FpuIssueInfo info;
+					info.pc = VEX_CPU->lastStagePc;
+					info.rd = VEX_CPU->writeBack_FpuPlugin_commit_payload_rd;
+					info.opcode = VEX_CPU->writeBack_FpuPlugin_commit_payload_opcode;
+					fpuPending.push_back(info);
+				}
+
+				// Architectural F-register writeback trace from FpuCore, tagged with
+				// the original instruction PC captured at FPU command issue time.
+				if(VEX_CPU->FpuPlugin_fpu && VEX_CPU->FpuPlugin_fpu->fregWriteValid){
+					uint32_t fpc = VEX_CPU->lastStagePc;
+					uint32_t frdHw  = VEX_CPU->FpuPlugin_fpu->fregWriteReg;
+					#ifdef RVD
+					uint64_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					#else
+					uint32_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					#endif
+					for(auto it = fpuPending.begin(); it != fpuPending.end(); ++it){
+						if(it->rd == frdHw){
+							fpc = it->pc;
+							fpuPending.erase(it);
+							break;
+						}
+					}
+					fregTraces
+						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
+						<< " : f[" << std::dec << std::setw(2) << (uint32_t)frdHw
+						<< "] = 0x" << std::hex
+						#ifdef RVD
+						<< std::setw(16)
+						#else
+						<< std::setw(8)
+						#endif
+						<< std::setfill('0') << fval
+						<< std::dec << std::setfill(' ') << std::endl;
+				}
+
+				if(riscvRefEnable){
+                    if(VEX_CPU->FpuPlugin_port_rsp_valid && VEX_CPU->FpuPlugin_port_rsp_ready && VEX_CPU->lastStageIsFiring){
                         FpuRsp c;
-                        c.value = top->VexRiscv->FpuPlugin_port_rsp_payload_value;
-                        c.flags = (top->VexRiscv->FpuPlugin_port_rsp_payload_NX << 0) |
-                                  (top->VexRiscv->FpuPlugin_port_rsp_payload_NV << 4);
+                        c.value = VEX_CPU->FpuPlugin_port_rsp_payload_value;
+                        c.flags = (VEX_CPU->FpuPlugin_port_rsp_payload_NX << 0) |
+                                  (VEX_CPU->FpuPlugin_port_rsp_payload_NV << 4);
                         riscvRef.fpuRsp.push(c);
                     }
 
-                    if(top->VexRiscv->FpuPlugin_port_completion_valid && top->VexRiscv->FpuPlugin_port_completion_payload_written){
+                    if(VEX_CPU->FpuPlugin_port_completion_valid && VEX_CPU->FpuPlugin_port_completion_payload_written){
                         FpuCompletion c;
-                        c.flags = (top->VexRiscv->FpuPlugin_port_completion_payload_flags_NX << 0) |
-                                  (top->VexRiscv->FpuPlugin_port_completion_payload_flags_UF << 1) |
-                                  (top->VexRiscv->FpuPlugin_port_completion_payload_flags_OF << 2) |
-                                  (top->VexRiscv->FpuPlugin_port_completion_payload_flags_DZ << 3) |
-                                  (top->VexRiscv->FpuPlugin_port_completion_payload_flags_NV << 4);
+                        c.flags = (VEX_CPU->FpuPlugin_port_completion_payload_flags_NX << 0) |
+                                  (VEX_CPU->FpuPlugin_port_completion_payload_flags_UF << 1) |
+                                  (VEX_CPU->FpuPlugin_port_completion_payload_flags_OF << 2) |
+                                  (VEX_CPU->FpuPlugin_port_completion_payload_flags_DZ << 3) |
+                                  (VEX_CPU->FpuPlugin_port_completion_payload_flags_NV << 4);
                         riscvRef.fpuCompletion.push(c);
                     }
                 }
                 #endif
 
 
-
-                if(top->VexRiscv->lastStageIsFiring){
+                if(VEX_CPU->lastStageIsFiring){
                    	if(riscvRefEnable) {
 //                        privilegeCounters[riscvRef.privilege]++;
 //                        if((riscvRef.stepCounter & 0xFFFFF) == 0){
@@ -1810,14 +1885,14 @@ public:
 //                            cout << "- S " << privilegeCounters[1] << endl;
 //                            cout << "- M " << privilegeCounters[3] << endl;
 //                        }
-                        riscvRef.dutRfWriteValue = top->VexRiscv->lastStageRegFileWrite_payload_data;
+                        riscvRef.dutRfWriteValue = VEX_CPU->lastStageRegFileWrite_payload_data;
                    	    riscvRef.step();
                    	    bool mIntTimer = false;
                    	    bool mIntExt = false;
                    	}
 
-                   	if(riscvRefEnable && top->VexRiscv->lastStagePc != riscvRef.lastPc){
-						cout << hex << " pc missmatch " << top->VexRiscv->lastStagePc << " should be " << riscvRef.lastPc << dec << endl;
+                   	if(riscvRefEnable && VEX_CPU->lastStagePc != riscvRef.lastPc){
+						cout << hex << " pc missmatch " << VEX_CPU->lastStagePc << " should be " << riscvRef.lastPc << dec << endl;
 						fail();
 					}
 
@@ -1826,16 +1901,16 @@ public:
                 	int32_t rfWriteAddress;
                 	int32_t rfWriteData;
 
-                    if(top->VexRiscv->lastStageRegFileWrite_valid == 1 && top->VexRiscv->lastStageRegFileWrite_payload_address != 0){
+                    if(VEX_CPU->lastStageRegFileWrite_valid == 1 && VEX_CPU->lastStageRegFileWrite_payload_address != 0){
                     	rfWriteValid = true;
-                    	rfWriteAddress = top->VexRiscv->lastStageRegFileWrite_payload_address;
-                    	rfWriteData = top->VexRiscv->lastStageRegFileWrite_payload_data;
+                    	rfWriteAddress = VEX_CPU->lastStageRegFileWrite_payload_address;
+                    	rfWriteData = VEX_CPU->lastStageRegFileWrite_payload_data;
                     	#ifdef TRACE_ACCESS
                         regTraces <<
                             #ifdef TRACE_WITH_TIME
                             currentTime <<
                              #endif
-                             " PC " << hex << setw(8) <<  top->VexRiscv->lastStagePc << " : reg[" << dec << setw(2) << (uint32_t)top->VexRiscv->lastStageRegFileWrite_payload_address << "] = " << hex << setw(8) << top->VexRiscv->lastStageRegFileWrite_payload_data <<  dec << endl;
+                             " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << " : reg[" << dec << setw(2) << (uint32_t)VEX_CPU->lastStageRegFileWrite_payload_address << "] = " << hex << setw(8) << VEX_CPU->lastStageRegFileWrite_payload_data <<  dec << endl;
                         #endif
                     } else {
                         #ifdef TRACE_ACCESS
@@ -1843,7 +1918,7 @@ public:
                                 #ifdef TRACE_WITH_TIME
                                 currentTime <<
                                  #endif
-                                 " PC " << hex << setw(8) <<  top->VexRiscv->lastStagePc << dec << endl;
+                                 " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << dec << endl;
                         #endif
                     }
 					if(riscvRefEnable) if(rfWriteValid != riscvRef.rfWriteValid ||
@@ -1856,7 +1931,16 @@ public:
                 }
 
                 #ifdef CSR
-                    if(top->VexRiscv->CsrPlugin_hadException){
+                    if(VEX_CPU->CsrPlugin_hadException){
+                        // Log exception PC and RISC-V exception cause code (stdout + run.logTrace)
+                        std::cout << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
+                                  << VEX_CPU->lastStagePc
+                                  << " cause=" << std::dec << (unsigned)VEX_CPU->CsrPlugin_trapCause
+                                  << std::setfill(' ') << std::endl;
+                        logTraces << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
+                                  << VEX_CPU->lastStagePc
+                                  << " cause=" << std::dec << (unsigned)VEX_CPU->CsrPlugin_trapCause
+                                  << std::setfill(' ') << std::endl;
                         if(riscvRefEnable) {
                             riscvRef.step();
                         }
@@ -1897,7 +1981,7 @@ public:
 		} catch (const std::exception& e) {
 			staticMutex.lock();
 
-			cout << "FAIL " <<  name << " at PC=" << hex << setw(8) << top->VexRiscv->lastStagePc << dec; //<<  " seed : " << seed <<
+			cout << "FAIL " <<  name << " at PC=" << hex << setw(8) << VEX_CPU->lastStagePc << dec; //<<  " seed : " << seed <<
 			if(riscvRefEnable) cout << hex << " REF PC=" << riscvRef.lastPc << " REF I=" << riscvRef.lastInstruction << dec;
 			cout << " time=" << i;
 			cout << endl;
@@ -1943,7 +2027,28 @@ public:
 	virtual void dutPutChar(char c){}
 
 	virtual void dBusAccess(uint32_t addr,bool wr, uint32_t size, uint8_t *dataBytes, bool *error) {
-        uint32_t *data = ((uint32_t*)dataBytes);
+		uint32_t *data = ((uint32_t*)dataBytes);
+
+#ifdef TRACE_ACCESS
+		if(wr){
+			uint32_t logPc = VEX_CPU->__PVT__memory_to_writeBack_PC;
+			uint64_t value = 0;
+			uint32_t capped = size;
+			if(capped > 8) capped = 8;
+			for(uint32_t b = 0; b < capped; b++){
+				value |= ((uint64_t)((uint8_t*)dataBytes)[b]) << (8*b);
+			}
+			#ifdef TRACE_WITH_TIME
+			memTraces << currentTime;
+			#endif
+			memTraces << " PC " << hex << setw(8) << setfill('0') << logPc;
+			memTraces << " : MEM[0x" << setw(8) << addr << "] <= " << dec << size << " bytes : 0x";
+			uint32_t widthVal = size * 2;
+			if(widthVal < 2) widthVal = 2;
+			memTraces << hex << setw(static_cast<int>(widthVal)) << value;
+			memTraces << dec << setfill(' ') << endl;
+		}
+#endif
 		if(wr){
 			switch(addr){
 			case 0xF0010000u: {
@@ -3204,9 +3309,9 @@ public:
 	}
 
 	virtual void checks(){
-		if(top->VexRiscv->lastStageRegFileWrite_valid == 1 && top->VexRiscv->lastStageRegFileWrite_payload_address != 0){
-			assertEq(top->VexRiscv->lastStageRegFileWrite_payload_address, regFileWriteRefArray[regFileWriteRefIndex][0]);
-			assertEq(top->VexRiscv->lastStageRegFileWrite_payload_data, regFileWriteRefArray[regFileWriteRefIndex][1]);
+		if(VEX_CPU->lastStageRegFileWrite_valid == 1 && VEX_CPU->lastStageRegFileWrite_payload_address != 0){
+			assertEq(VEX_CPU->lastStageRegFileWrite_payload_address, regFileWriteRefArray[regFileWriteRefIndex][0]);
+			assertEq(VEX_CPU->lastStageRegFileWrite_payload_data, regFileWriteRefArray[regFileWriteRefIndex][1]);
 			//printf("%d\n",i);
 
 			regFileWriteRefIndex++;
@@ -3230,8 +3335,8 @@ public:
 	}
 
 	virtual void checks(){
-		if(top->VexRiscv->lastStageRegFileWrite_valid == 1 && top->VexRiscv->lastStageRegFileWrite_payload_address == 28){
-			assertEq(top->VexRiscv->lastStageRegFileWrite_payload_data, ref[refIndex]);
+		if(VEX_CPU->lastStageRegFileWrite_valid == 1 && VEX_CPU->lastStageRegFileWrite_payload_address == 28){
+			assertEq(VEX_CPU->lastStageRegFileWrite_payload_data, ref[refIndex]);
 			//printf("%d\n",i);
 
 			refIndex++;
@@ -3252,20 +3357,20 @@ public:
 
 	virtual void postReset() {
 //		#ifdef CSR
-//		top->VexRiscv->prefetch_PcManagerSimplePlugin_pcReg = 0x80000000u;
+//		VEX_CPU->prefetch_PcManagerSimplePlugin_pcReg = 0x80000000u;
 //		#else
 //		#endif
 	}
 
 	virtual void checks(){
-		if(top->VexRiscv->lastStageIsFiring && top->VexRiscv->lastStageInstruction == 0x00000013){
+		if(VEX_CPU->lastStageIsFiring && VEX_CPU->lastStageInstruction == 0x00000013){
 			uint32_t instruction;
 			bool error;
-			Workspace::mem.read(top->VexRiscv->lastStagePc, 4, (uint8_t*)&instruction);
-			//printf("%x => %x\n", top->VexRiscv->lastStagePc, instruction );
+			Workspace::mem.read(VEX_CPU->lastStagePc, 4, (uint8_t*)&instruction);
+			//printf("%x => %x\n", VEX_CPU->lastStagePc, instruction );
 			if(instruction == 0x00000073){
-				uint32_t code = top->VexRiscv->RegFilePlugin_regFile[28];
-				uint32_t code2 = top->VexRiscv->RegFilePlugin_regFile[3];
+				uint32_t code = VEX_CPU->RegFilePlugin_regFile[28];
+				uint32_t code2 = VEX_CPU->RegFilePlugin_regFile[3];
 				if((code & 1) == 0 && (code2 & 1) == 0){
 					cout << "Wrong error code"<< endl;
 					fail();
@@ -3341,7 +3446,7 @@ public:
 		out32.open (name + ".out32");
 		this->name = name;
 		if(name == "C.ADDI16SP" || name == "C.ADDI4SPN"){
-    		top->VexRiscv->RegFilePlugin_regFile[2] = 0;
+    		VEX_CPU->RegFilePlugin_regFile[2] = 0;
 		}
 	}
 
@@ -3567,7 +3672,7 @@ public:
 
     virtual void postReset(){
         Workspace::postReset();
-        top->VexRiscv->DebugPlugin_debugUsed = 1;
+        VEX_CPU->DebugPlugin_debugUsed = 1;
     }
 };
 
@@ -4159,12 +4264,86 @@ int main(int argc, char **argv, char **env) {
 	Verilated::randReset(2);
 	Verilated::commandArgs(argc, argv);
 
+#if VM_COVERAGE
+	g_cov_path = "logs/coverage.dat";
+	if (const char* cov_arg = Verilated::commandArgsPlusMatch("covfile=")) {
+		const char* val = cov_arg + std::strlen("+covfile=");
+		if (*val) g_cov_path = val;
+	}
+	const auto slash_pos = g_cov_path.find_last_of('/');
+	if (slash_pos != std::string::npos && slash_pos != 0) {
+		Verilated::mkdir(g_cov_path.substr(0, slash_pos).c_str());
+	} else {
+		Verilated::mkdir("logs");
+	}
+	Verilated::threadContextp()->coveragep()->zero();
+	atexit(write_coverage_dat);
+#endif
+
 	printf("BOOT\n");
 	timespec startedAt = timer_start();
 
+    auto endsWith = [](const std::string &value, const std::string &ending)->bool{
+        if (ending.size() > value.size()) return false;
+        return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+    };
+
+    auto fileExists = [](const std::string &path)->bool{
+        FILE *fp = fopen(path.c_str(), "rb");
+        if(!fp) return false;
+        fclose(fp);
+        return true;
+    };
+
+    auto convertElfToIhex = [](const std::string &elfPath)->std::string{
+        // create temp file path
+        char tmpTpl[] = "/tmp/vexriscv_elf_XXXXXX";
+        int fd = mkstemp(tmpTpl);
+        if(fd < 0){
+            std::cerr << "Failed to create temporary file for ihex output" << std::endl;
+            exit(1);
+        }
+        close(fd);
+        std::string hexPath = std::string(tmpTpl) + ".hex";
+
+        // Allow override from env
+        std::vector<std::string> candidates;
+        const char* envObjcopy = getenv("RISCV_OBJCOPY");
+        if(envObjcopy && strlen(envObjcopy)) candidates.emplace_back(envObjcopy);
+        candidates.emplace_back("riscv64-unknown-elf-objcopy");
+        candidates.emplace_back("riscv32-unknown-elf-objcopy");
+
+        int lastRet = -1;
+        for(const auto &oc : candidates){
+            std::string cmd = oc + " -O ihex \"" + elfPath + "\" \"" + hexPath + "\"";
+            lastRet = system(cmd.c_str());
+            if(lastRet == 0){
+                return hexPath;
+            }
+        }
+        std::cerr << "Could not convert ELF to Intel HEX. Tried:";
+        for(const auto &oc : candidates) std::cerr << " " << oc;
+        std::cerr << std::endl;
+        std::cerr << "Hint: install a RISC-V toolchain providing riscv64-unknown-elf-objcopy." << std::endl;
+        exit(2);
+    };
 
 #ifdef LINUX_SOC_SMP
     {
+
+        // When running the Verilator binary as a generic ELF/HEX runner (our fuzz harness
+        // passes an image path as argv[1]), do NOT take the Linux boot path. Fall through
+        // to the standard RUN_HEX/DEBUG_PLUGIN_EXTERNAL flow below.
+        int imageArgIdx = -1;
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i][0] == '+') continue;
+            imageArgIdx = i;
+            break;
+        }
+        if (imageArgIdx != -1) {
+            // A baremetal image was provided.
+            // Skip LinuxSocSmp boot and let the normal runner below handle it.
+        } else {
 
 	    LinuxSocSmp soc("linuxSmp");
 	    #ifndef DEBUG_PLUGIN_EXTERNAL
@@ -4181,6 +4360,7 @@ int main(int argc, char **argv, char **env) {
 //		soc.run((496300000l + 2000000) / 2);
 //		soc.run(438700000l/2);
         return -1;
+        }
     }
 #endif
 
@@ -4275,11 +4455,49 @@ int main(int argc, char **argv, char **env) {
 		#if defined(DEBUG_PLUGIN_EXTERNAL) || defined(RUN_HEX)
 		{
 			WorkspaceRegression w("run");
-			#ifdef RUN_HEX
-			//w.loadHex("/home/spinalvm/hdl/zephyr/zephyrSpinalHdl/samples/synchronization/build/zephyr/zephyr.hex");
-			w.loadHex(RUN_HEX);
-			w.withRiscvRef();
-			#endif
+            int imageArgIdx = -1;
+            for (int i = 1; i < argc; ++i) {
+                if (argv[i][0] == '+') continue;
+                imageArgIdx = i;
+                break;
+            }
+            // If an argument is provided, treat it as input image:
+            // - .elf: convert to Intel HEX using objcopy then load
+            // - .hex: load directly
+            // Otherwise, fall back to RUN_HEX if defined.
+            if(imageArgIdx != -1){
+                std::string in = argv[imageArgIdx];
+                std::string toLoad = in;
+                if(endsWith(in, ".elf")){
+                    toLoad = convertElfToIhex(in);
+                } else if(!endsWith(in, ".hex")){
+                    std::cerr << "Unknown input format: " << in << std::endl;
+                    std::cerr << "Please pass a .elf or .hex image." << std::endl;
+                    exit(3);
+                }
+                if(!fileExists(toLoad)){
+                    std::cerr << "Input file not found: " << toLoad << std::endl;
+                    exit(4);
+                }
+                w.loadHex(toLoad);
+                w.withRiscvRef();
+            } else {
+                #ifdef RUN_HEX
+                {
+                    std::string fallback = std::string(RUN_HEX);
+                    if(fallback.empty()){
+                        std::cerr << "No input provided. Usage: VVexRiscv <program.elf|program.hex>" << std::endl;
+                        exit(5);
+                    }
+                    //w.loadHex("/home/spinalvm/hdl/zephyr/zephyrSpinalHdl/samples/synchronization/build/zephyr/zephyr.hex");
+                    w.loadHex(fallback);
+                    w.withRiscvRef();
+                }
+                #else
+                std::cerr << "No input provided. Usage: VVexRiscv <program.elf|program.hex>" << std::endl;
+                exit(5);
+                #endif
+            }
 			w.setIStall(false);
 			w.setDStall(false);
 
