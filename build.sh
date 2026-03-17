@@ -3,13 +3,15 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh [--isa ISA] [--cores N] [--coverage|--coverage-light|--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
+Usage: ./build.sh --isa <rv32|rv32f|rv32fd> --cores N [--out-dir DIR] [--coverage|--coverage-light|--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
 
 Build a Verilator-based VexRiscv simulator that accepts an ELF/HEX path.
 
 Options:
-  --isa ISA                  ISA tag used for output naming (default: rv32). VexRiscv is RV32-only.
-  --cores N                  Core count tag used for output naming (default: 1). This branch supports N=1 only.
+  --isa <rv32|rv32f|rv32fd>   ISA selection (RV64 is unsupported; will error)
+  --cores N                  Number of cores (log branch supports N=1 only)
+  --out-dir DIR              Output directory for the final binary (default: ./build_result)
+                             You can also set CX_OUT_DIR (shared across repos) or OUT_DIR.
   --coverage                 Enable Verilator full coverage (suffix _cov)
   --coverage-light           Enable lightweight coverage (suffix _cov_light)
   --no-coverage              Disable coverage (default)
@@ -21,16 +23,19 @@ Output artifact:
   build_result/vexriscv_<isa>_<N>c[_cov|_cov_light]
 
 Examples:
+  ./build.sh --isa rv32fd --cores 1
+  ./build.sh --isa rv32f --cores 1 --coverage-light
   ./build.sh --isa rv32 --cores 1 -- --compiler clang
 EOF
 }
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-ISA="rv32"
+ISA="rv32fd"
 CORES=1
 COVERAGE_MODE="none" # none|full|light
 CLEAN=0
+OUT_DIR_OPT=""
 EXTRA_VERILATOR_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -48,6 +53,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cores=*)
       CORES="${1#*=}"
+      ;;
+    --out-dir)
+      [[ $# -ge 2 ]] || die "--out-dir requires a value"
+      OUT_DIR_OPT="$2"; shift
+      ;;
+    --out-dir=*)
+      OUT_DIR_OPT="${1#*=}"
       ;;
     --coverage) COVERAGE_MODE="full" ;;
     --coverage-light) COVERAGE_MODE="light" ;;
@@ -67,16 +79,19 @@ if (( CORES < 1 )); then
   die "--cores must be >= 1"
 fi
 
-if [[ "${ISA,,}" != rv32 ]]; then
-  die "This branch supports --isa rv32 only (requested: ${ISA})"
-fi
+case "${ISA,,}" in
+  rv32|rv32f|rv32fd) ;;
+  rv64|rv64*|riscv64|riscv64*) die "RV64 is unsupported in this repo" ;;
+  *) die "unsupported --isa '${ISA}' (supported: rv32 rv32f rv32fd)" ;;
+esac
 
 if (( CORES != 1 )); then
   die "--cores ${CORES} requires SMP support (use the 2hart worktree)"
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="${ROOT_DIR}/build_result"
+OUT_DIR_DEFAULT="${ROOT_DIR}/build_result"
+OUT_DIR="${OUT_DIR_OPT:-${CX_OUT_DIR:-${OUT_DIR:-${OUT_DIR_DEFAULT}}}}"
 OUT_SUFFIX=""
 case "$COVERAGE_MODE" in
   full) OUT_SUFFIX="_cov" ;;
@@ -114,7 +129,23 @@ if (( CLEAN )); then
 fi
 rm -f "${OUT_BIN}"
 
-SCALA_MAIN="vexriscv.demo.GenFull"
+SCALA_MAIN=""
+RVF="no"
+RVD="no"
+case "${ISA,,}" in
+  rv32)
+    SCALA_MAIN="vexriscv.demo.GenMaxRv32"
+    RVF="no"; RVD="no"
+    ;;
+  rv32f)
+    SCALA_MAIN="vexriscv.demo.GenMaxRv32F"
+    RVF="yes"; RVD="no"
+    ;;
+  rv32fd)
+    SCALA_MAIN="vexriscv.demo.GenMax"
+    RVF="yes"; RVD="yes"
+    ;;
+esac
 
 verilator_args=("-I${ROOT_DIR}/src/test/cpp/regression")
 case "$COVERAGE_MODE" in
@@ -133,7 +164,12 @@ echo "[2/3] Verilator build: ${OUT_BIN}"
 pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
 WITH_RISCV_REF="${WITH_RISCV_REF:-no}" make clean
 WITH_RISCV_REF="${WITH_RISCV_REF:-no}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
-  make verilate RUN_HEX="" MAIN_CPP=main.cpp TRACE_ACCESS=yes TRACE_WITH_TIME=yes
+  make verilate RUN_HEX="" MAIN_CPP=main.cpp \
+  COMPRESSED=yes LRSC=yes AMO=yes \
+  RVF="${RVF}" RVD="${RVD}" \
+  SUPERVISOR=yes MMU=yes CSR=yes \
+  IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 \
+  TRACE_ACCESS=yes TRACE_WITH_TIME=yes
 make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv
 cp -f "obj_dir/VVexRiscv" "${OUT_BIN}"
 chmod +x "${OUT_BIN}"
