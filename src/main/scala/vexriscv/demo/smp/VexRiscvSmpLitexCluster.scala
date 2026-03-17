@@ -162,8 +162,13 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
       cpuConfigs = List.tabulate(cpuCount) { hartId => {
         val c = vexRiscvConfig(
           hartId = hartId,
-          ioRange = address => address.msb,
-          resetVector = 0,
+          // Keep a simple memory map for fuzzing:
+          // - DRAM at 0x8000_0000...
+          // - MMIO at 0xFxxx_xxxx
+          // IO decode: treat 0xFxxx_xxxx (byte addressing) as MMIO.
+          // Some bridges expose word addresses; in that case the byte top-nibble is at address(29 downto 26).
+          ioRange = address => (address(31 downto 28) === 0xF) || (address(29 downto 26) === 0xF),
+          resetVector = 0x80000000l,
           iBusWidth = iBusWidth,
           dBusWidth = dBusWidth,
           iCacheSize = iCacheSize,
@@ -195,7 +200,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
       hardwareBreakpoints = hardwareBreakpoints
     ),
     liteDram = LiteDramNativeParameter(addressWidth = 32, dataWidth = liteDramWidth),
-    liteDramMapping = SizeMapping(0x40000000l, 0x40000000l),
+    liteDramMapping = SizeMapping(0x80000000l, 0x70000000l),
     coherentDma = coherentDma,
     wishboneMemory = wishboneMemory,
     cpuPerFpu = cpuPerFpu,

@@ -9,7 +9,8 @@ Build a Verilator-based VexRiscv simulator that accepts an ELF/HEX path.
 
 Options:
   --isa <rv32|rv32f|rv32fd>   ISA selection (RV64 is unsupported; will error)
-  --cores N                  Number of cores (log branch supports N=1 only)
+  --cores N                  Number of cores (supported: 1 or 2)
+                             Note: SMP 2-core supports rv32 and rv32fd only (rv32f is unsupported).
   --out-dir DIR              Output directory for the final binary (default: ./build_result)
                              You can also set CX_OUT_DIR (shared across repos) or OUT_DIR.
   --coverage                 Enable Verilator full coverage (suffix _cov)
@@ -20,12 +21,13 @@ Options:
   --                         Forward remaining args to Verilator
 
 Output artifact:
-  build_result/vexriscv_<isa>_<N>c[_cov|_cov_light]
+  <out-dir>/vexriscv_<isa>_<N>c[_cov|_cov_light]
 
 Examples:
   ./build.sh --isa rv32fd --cores 1
   ./build.sh --isa rv32f --cores 1 --coverage-light
   ./build.sh --isa rv32 --cores 1 -- --compiler clang
+  ./build.sh --isa rv32 --cores 2
 EOF
 }
 
@@ -78,16 +80,15 @@ fi
 if (( CORES < 1 )); then
   die "--cores must be >= 1"
 fi
+if (( CORES > 2 )); then
+  die "--cores ${CORES} is unsupported (supported: 1 or 2)"
+fi
 
 case "${ISA,,}" in
   rv32|rv32f|rv32fd) ;;
   rv64|rv64*|riscv64|riscv64*) die "RV64 is unsupported in this repo" ;;
   *) die "unsupported --isa '${ISA}' (supported: rv32 rv32f rv32fd)" ;;
 esac
-
-if (( CORES != 1 )); then
-  die "--cores ${CORES} requires SMP support (use the 2hart worktree)"
-fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR_DEFAULT="${ROOT_DIR}/build_result"
@@ -147,6 +148,13 @@ case "${ISA,,}" in
     ;;
 esac
 
+if (( CORES == 2 )); then
+  if [[ "${ISA,,}" == "rv32f" ]]; then
+    die "SMP 2-core build does not support --isa rv32f (use rv32 or rv32fd)"
+  fi
+  SCALA_MAIN="vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen"
+fi
+
 verilator_args=("-I${ROOT_DIR}/src/test/cpp/regression")
 case "$COVERAGE_MODE" in
   full) verilator_args+=("--coverage") ;;
@@ -158,16 +166,26 @@ fi
 VERILATOR_ARGS_STR="$(printf '%q ' "${verilator_args[@]}")"
 
 echo "[1/3] Scala netlist generation: ${SCALA_MAIN}"
-"${SBT_CMD}" "runMain ${SCALA_MAIN}"
+if (( CORES == 1 )); then
+  "${SBT_CMD}" "runMain ${SCALA_MAIN}"
+else
+  smp_fpu="false"
+  case "${ISA,,}" in
+    rv32) smp_fpu="false" ;;
+    rv32fd) smp_fpu="true" ;;
+    *) die "internal: unexpected ISA for SMP build: ${ISA}" ;;
+  esac
+  "${SBT_CMD}" "runMain ${SCALA_MAIN} --cpu-count 2 --netlist-name VexRiscv --netlist-directory . --fpu ${smp_fpu}"
+fi
 
 echo "[2/3] Verilator build: ${OUT_BIN}"
 pushd "${ROOT_DIR}/src/test/cpp/regression" >/dev/null
 WITH_RISCV_REF="${WITH_RISCV_REF:-no}" make clean
 WITH_RISCV_REF="${WITH_RISCV_REF:-no}" VERILATOR_ARGS="${VERILATOR_ARGS_STR}" \
-  make verilate RUN_HEX="" MAIN_CPP=main.cpp \
+  make verilate RUN_HEX="" MAIN_CPP="$([[ ${CORES} -eq 2 ]] && echo main_smp.cpp || echo main.cpp)" \
   COMPRESSED=yes LRSC=yes AMO=yes \
   RVF="${RVF}" RVD="${RVD}" \
-  SUPERVISOR=yes MMU=yes CSR=yes \
+  SUPERVISOR=yes MMU=yes CSR=yes $([[ ${CORES} -eq 2 ]] && echo LINUX_SOC_SMP=yes || true) \
   IBUS_DATA_WIDTH=64 DBUS_LOAD_DATA_WIDTH=64 DBUS_STORE_DATA_WIDTH=64 \
   TRACE_ACCESS=yes TRACE_WITH_TIME=yes
 make -j"$(nproc)" -C obj_dir -f VVexRiscv.mk VVexRiscv

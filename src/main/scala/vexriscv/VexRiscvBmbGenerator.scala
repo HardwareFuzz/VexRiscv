@@ -18,7 +18,7 @@ object VexRiscvBmbGenerator{
   val DEBUG_BMB = 4
 }
 
-case class VexRiscvBmbGenerator()(implicit interconnectSmp: BmbInterconnectGenerator = null) extends Area {
+case class VexRiscvBmbGenerator(definitionName: String = "VexRiscvCore")(implicit interconnectSmp: BmbInterconnectGenerator = null) extends Area {
   import VexRiscvBmbGenerator._
 
   val config = Handle[VexRiscvConfig]
@@ -120,7 +120,9 @@ case class VexRiscvBmbGenerator()(implicit interconnectSmp: BmbInterconnectGener
       case _ =>
     }
 
-    val cpu = new VexRiscv(config)
+    // Avoid name collision with SMP top-level netlist name "VexRiscv".
+    // Use a configurable definition name so SMP can make each core unique if needed.
+    val cpu = new VexRiscv(config).setDefinitionName(definitionName)
     def doExport(value : => Any, postfix : String) = {
       sexport(Handle(value).setCompositeName(VexRiscvBmbGenerator.this, postfix))
     }
