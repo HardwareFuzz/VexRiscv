@@ -144,6 +144,8 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   plugins ++= config.plugins
 
   //regression usage
+  val executePc = CombInit(execute.input(config.PC)).dontSimplifyIt().setName("executePc").addAttribute(Verilator.public)
+  val executeIsFiring = CombInit(execute.arbitration.isFiring).dontSimplifyIt().setName("executeIsFiring").addAttribute(Verilator.public)
   val lastStageInstruction = CombInit(stages.last.input(config.INSTRUCTION)).dontSimplifyIt().addAttribute (Verilator.public)
   val lastStagePc = CombInit(stages.last.input(config.PC)).dontSimplifyIt().addAttribute(Verilator.public)
   val lastStageIsValid = CombInit(stages.last.arbitration.isValid).dontSimplifyIt().addAttribute(Verilator.public)
@@ -156,5 +158,4 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   }
   execute.arbitration.flushNext.noBackendCombMerge
 }
-
 
