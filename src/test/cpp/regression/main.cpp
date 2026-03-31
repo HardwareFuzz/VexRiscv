@@ -18,6 +18,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <iomanip>
 #include <queue>
@@ -1349,14 +1350,13 @@ public:
 	ofstream logTraces;
 	ofstream fregTraces;
 
-#ifdef RVF
-	struct FpuIssueInfo {
-		uint32_t pc;
-		uint8_t rd;
-		uint8_t opcode;
-	};
-	std::vector<FpuIssueInfo> fpuPending;
-#endif
+	uint64_t currentClockCycle() const {
+		return instanceCycles + 1;
+	}
+
+	uint64_t normalizeStartCycle(uint64_t raw) const {
+		return raw != 0 ? raw : currentClockCycle();
+	}
 
 	struct timespec start_time;
 
@@ -1805,8 +1805,7 @@ public:
 				#endif
 
 				#ifdef RVF
-				// Capture DUT FPU commit stream for the golden model and track
-				// architectural PCs for FP register writes.
+				// Capture DUT FPU commit stream for the golden model.
 				if(VEX_CPU->writeBack_FpuPlugin_commit_valid &&
 				   VEX_CPU->writeBack_FpuPlugin_commit_ready &&
 				   VEX_CPU->writeBack_FpuPlugin_commit_payload_write){
@@ -1816,31 +1815,20 @@ public:
 						c.value = VEX_CPU->writeBack_FpuPlugin_commit_payload_value;
 						riscvRef.fpuCommit.push(c);
 					}
-
-					FpuIssueInfo info;
-					info.pc = VEX_CPU->lastStagePc;
-					info.rd = VEX_CPU->writeBack_FpuPlugin_commit_payload_rd;
-					info.opcode = VEX_CPU->writeBack_FpuPlugin_commit_payload_opcode;
-					fpuPending.push_back(info);
 				}
 
 				// Architectural F-register writeback trace from FpuCore, tagged with
-				// the original instruction PC captured at FPU command issue time.
+				// the original instruction metadata carried through the FPU pipeline.
 				if(VEX_CPU->FpuPlugin_fpu && VEX_CPU->FpuPlugin_fpu->fregWriteValid){
-					uint32_t fpc = VEX_CPU->lastStagePc;
+					uint32_t fpc = VEX_CPU->FpuPlugin_fpu->fregWritePc;
+					uint64_t fclkStart = normalizeStartCycle(VEX_CPU->FpuPlugin_fpu->fregWriteStartCycle);
+					uint64_t fclkEnd = currentClockCycle();
 					uint32_t frdHw  = VEX_CPU->FpuPlugin_fpu->fregWriteReg;
 					#ifdef RVD
 					uint64_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
 					#else
 					uint32_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
 					#endif
-					for(auto it = fpuPending.begin(); it != fpuPending.end(); ++it){
-						if(it->rd == frdHw){
-							fpc = it->pc;
-							fpuPending.erase(it);
-							break;
-						}
-					}
 					fregTraces
 						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
 						<< " : f[" << std::dec << std::setw(2) << (uint32_t)frdHw
@@ -1851,7 +1839,11 @@ public:
 						<< std::setw(8)
 						#endif
 						<< std::setfill('0') << fval
-						<< std::dec << std::setfill(' ') << std::endl;
+						<< std::dec << std::setfill(' ')
+						<< " clk_start=" << fclkStart
+						<< " clk_end=" << fclkEnd
+						<< " clk_span=" << (fclkEnd - fclkStart + 1)
+						<< std::endl;
 				}
 
 				if(riscvRefEnable){
@@ -1877,6 +1869,8 @@ public:
 
 
                 if(VEX_CPU->lastStageIsFiring){
+                	uint64_t clkEnd = currentClockCycle();
+                	uint64_t clkStart = normalizeStartCycle(VEX_CPU->lastStageStartCycle);
                    	if(riscvRefEnable) {
 //                        privilegeCounters[riscvRef.privilege]++;
 //                        if((riscvRef.stepCounter & 0xFFFFF) == 0){
@@ -1910,7 +1904,10 @@ public:
                             #ifdef TRACE_WITH_TIME
                             currentTime <<
                              #endif
-                             " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << " : reg[" << dec << setw(2) << (uint32_t)VEX_CPU->lastStageRegFileWrite_payload_address << "] = " << hex << setw(8) << VEX_CPU->lastStageRegFileWrite_payload_data <<  dec << endl;
+                             " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << " : reg[" << dec << setw(2) << (uint32_t)VEX_CPU->lastStageRegFileWrite_payload_address << "] = " << hex << setw(8) << VEX_CPU->lastStageRegFileWrite_payload_data <<  dec
+                             << " clk_start=" << clkStart
+                             << " clk_end=" << clkEnd
+                             << " clk_span=" << (clkEnd - clkStart + 1) << endl;
                         #endif
                     } else {
                         #ifdef TRACE_ACCESS
@@ -1918,7 +1915,10 @@ public:
                                 #ifdef TRACE_WITH_TIME
                                 currentTime <<
                                  #endif
-                                 " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << dec << endl;
+                                 " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << dec
+                                 << " clk_start=" << clkStart
+                                 << " clk_end=" << clkEnd
+                                 << " clk_span=" << (clkEnd - clkStart + 1) << endl;
                         #endif
                     }
 					if(riscvRefEnable) if(rfWriteValid != riscvRef.rfWriteValid ||
@@ -1932,14 +1932,22 @@ public:
 
                 #ifdef CSR
                     if(VEX_CPU->CsrPlugin_hadException){
+                        uint64_t clkEnd = currentClockCycle();
+                        uint64_t clkStart = normalizeStartCycle(VEX_CPU->lastStageStartCycle);
                         // Log exception PC and RISC-V exception cause code (stdout + run.logTrace)
                         std::cout << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
                                   << VEX_CPU->lastStagePc
                                   << " cause=" << std::dec << (unsigned)VEX_CPU->CsrPlugin_trapCause
+                                  << " clk_start=" << clkStart
+                                  << " clk_end=" << clkEnd
+                                  << " clk_span=" << (clkEnd - clkStart + 1)
                                   << std::setfill(' ') << std::endl;
                         logTraces << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
                                   << VEX_CPU->lastStagePc
                                   << " cause=" << std::dec << (unsigned)VEX_CPU->CsrPlugin_trapCause
+                                  << " clk_start=" << clkStart
+                                  << " clk_end=" << clkEnd
+                                  << " clk_span=" << (clkEnd - clkStart + 1)
                                   << std::setfill(' ') << std::endl;
                         if(riscvRefEnable) {
                             riscvRef.step();
@@ -2031,7 +2039,9 @@ public:
 
 #ifdef TRACE_ACCESS
 		if(wr){
-			uint32_t logPc = VEX_CPU->__PVT__memory_to_writeBack_PC;
+			uint32_t logPc = VEX_CPU->memoryStagePc;
+			uint64_t clkStart = normalizeStartCycle(VEX_CPU->memoryStageStartCycle);
+			uint64_t clkEnd = currentClockCycle();
 			uint64_t value = 0;
 			uint32_t capped = size;
 			if(capped > 8) capped = 8;
@@ -2046,7 +2056,10 @@ public:
 			uint32_t widthVal = size * 2;
 			if(widthVal < 2) widthVal = 2;
 			memTraces << hex << setw(static_cast<int>(widthVal)) << value;
-			memTraces << dec << setfill(' ') << endl;
+			memTraces << dec << setfill(' ')
+			          << " clk_start=" << clkStart
+			          << " clk_end=" << clkEnd
+			          << " clk_span=" << (clkEnd - clkStart + 1) << endl;
 		}
 #endif
 		if(wr){

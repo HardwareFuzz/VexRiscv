@@ -157,6 +157,8 @@ case class FpuCmd(p : FpuParameter) extends Bundle{
   val arg = Bits(2 bits) 
   val rs1, rs2, rs3 = p.rfAddress()
   val rd = p.rfAddress()
+  val pc = UInt(32 bits)
+  val startCycle = UInt(64 bits)
   val format = p.Format()
   val roundMode = FpuRoundMode()
 }

@@ -42,6 +42,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val opcode = p.Opcode()
     val rs1, rs2, rs3 = p.rfAddress()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val arg = p.Arg()
     val roundMode = FpuRoundMode()
     val format = p.withDouble generate FpuFormat()
@@ -52,6 +54,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val opcode = p.Opcode()
     val rs1, rs2, rs3 = p.internalFloating()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val arg = p.Arg()
     val roundMode = FpuRoundMode()
     val format = p.withDouble generate FpuFormat()
@@ -62,6 +66,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
   case class LoadInput() extends Bundle{
     val source = Source()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val i2f = Bool()
     val arg = Bits(2 bits)
     val roundMode = FpuRoundMode()
@@ -73,6 +79,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val opcode = p.Opcode()
     val rs1, rs2 = p.internalFloating()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val value = Bits(32 bits)
     val arg = Bits(2 bits)
     val roundMode = FpuRoundMode()
@@ -84,6 +92,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val source = Source()
     val rs1, rs2, rs3 = p.internalFloating()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val add = Bool()
     val divSqrt = Bool()
     val msb1, msb2 = Bool() //allow usage of msb bits of mul
@@ -96,6 +106,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val source = Source()
     val rs1, rs2 = p.internalFloating()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val div = Bool()
     val roundMode = FpuRoundMode()
     val format = p.withDouble generate FpuFormat()
@@ -105,6 +117,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val source = Source()
     val rs1, rs2 = p.internalFloating()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val roundMode = FpuRoundMode()
     val format = p.withDouble generate FpuFormat()
   }
@@ -114,6 +128,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val source = Source()
     val rs1 = p.internalFloating()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val roundMode = FpuRoundMode()
     val format = p.withDouble generate FpuFormat()
   }
@@ -124,6 +140,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val source = Source()
     val rs1, rs2 = FpuFloat(exponentSize = p.internalExponentSize, mantissaSize = p.internalMantissaSize+addExtraBits)
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val roundMode = FpuRoundMode()
     val format = p.withDouble generate FpuFormat()
     val needCommit = Bool()
@@ -133,6 +151,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
   class MergeInput() extends Bundle{
     val source = Source()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val value = p.writeFloating()
     val scrap = Bool()
     val roundMode = FpuRoundMode()
@@ -144,6 +164,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
   case class RoundOutput() extends Bundle{
     val source = Source()
     val rd = p.rfAddress()
+    val pc = UInt(32 bits)
+    val startCycle = UInt(64 bits)
     val value = p.internalFloating()
     val format = p.withDouble generate FpuFormat()
     val NV, NX, OF, UF, DZ = Bool()
@@ -292,6 +314,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     output.arg := s1.arg
     output.roundMode := s1.roundMode
     output.rd := s1.rd
+    output.pc := s1.pc
+    output.startCycle := s1.startCycle
     output.rs1 := rs(0).value
     output.rs2 := rs(1).value
     output.rs3 := rs(2).value
@@ -404,6 +428,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       when(!mulToAdd.valid) {
         add.source := input.source
         add.rd := input.rd
+        add.pc := input.pc
+        add.startCycle := input.startCycle
         add.roundMode := input.roundMode
         if(p.withDouble) add.format := input.format
         add.needCommit := True
@@ -424,6 +450,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     case class S0() extends Bundle{
       val source = Source()
       val rd = p.rfAddress()
+      val pc = UInt(32 bits)
+      val startCycle = UInt(64 bits)
       val value = p.storeLoadType()
       val i2f = Bool()
       val arg = Bits(2 bits)
@@ -443,6 +471,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       feed.ready := input.valid && output.ready
       output.source := input.source
       output.rd := input.rd
+      output.pc := input.pc
+      output.startCycle := input.startCycle
       output.value := feed.value
       output.i2f := input.i2f
       output.arg := input.arg
@@ -576,6 +606,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
         output.format := input.format
       }
       output.rd := input.rd
+      output.pc := input.pc
+      output.startCycle := input.startCycle
       output.value.sign      := recoded.sign
       output.value.exponent  := recoded.exponent
       output.value.mantissa  := recoded.mantissa @@ U"0"
@@ -826,6 +858,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     rfOutput.valid := input.valid && toFpuRf && !halt
     rfOutput.source := input.source
     rfOutput.rd := input.rd
+    rfOutput.pc := input.pc
+    rfOutput.startCycle := input.startCycle
     rfOutput.roundMode := input.roundMode
     if(p.withDouble) rfOutput.format := input.format
     rfOutput.scrap := False
@@ -1008,6 +1042,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       output.valid := input.valid && !input.add && !input.divSqrt
       output.source := input.source
       output.rd := input.rd
+      output.pc := input.pc
+      output.startCycle := input.startCycle
       if (p.withDouble) output.format := input.format
       output.roundMode := input.roundMode
       output.scrap := norm.scrap
@@ -1020,6 +1056,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
 
       mulToAdd.valid := input.valid && input.add
       mulToAdd.source := input.source
+      mulToAdd.pc := input.pc
+      mulToAdd.startCycle := input.startCycle
       mulToAdd.rs1.mantissa := norm.output.mantissa @@ norm.scrap //FMA Precision lost
       mulToAdd.rs1.exponent := norm.output.exponent
       mulToAdd.rs1.sign := norm.output.sign
@@ -1201,6 +1239,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     decode.divSqrtToMul.rs2.assignDontCare()
     decode.divSqrtToMul.rs3.assignDontCare()
     decode.divSqrtToMul.rd := input.rd
+    decode.divSqrtToMul.pc := input.pc
+    decode.divSqrtToMul.startCycle := input.startCycle
     decode.divSqrtToMul.add := False
     decode.divSqrtToMul.divSqrt := True
     decode.divSqrtToMul.msb1 := True
@@ -1494,6 +1534,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
 
       output.source := input.source
       output.rd := input.rd
+      output.pc := input.pc
+      output.startCycle := input.startCycle
       output.value.sign := xySign
       output.value.mantissa := (mantissa >> addExtraBits).resized
       output.value.exponent := exponent.resized
@@ -1664,6 +1706,8 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     output.DZ := input.DZ & write
     output.source := input.source
     output.rd := input.rd
+    output.pc := input.pc
+    output.startCycle := input.startCycle
     output.write := write
     if(p.withDouble) output.format := input.format
     output.value := patched
@@ -1676,14 +1720,20 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val fregWriteValid = Bool().setName("fregWriteValid").addAttribute(Verilator.public)
     val fregWriteReg   = UInt(p.rfAddress.getBitsWidth bits).setName("fregWriteReg").addAttribute(Verilator.public)
     val fregWriteData  = p.storeLoadType().setName("fregWriteData").addAttribute(Verilator.public)
+    val fregWritePc = UInt(32 bits).setName("fregWritePc").addAttribute(Verilator.public)
+    val fregWriteStartCycle = UInt(64 bits).setName("fregWriteStartCycle").addAttribute(Verilator.public)
 
     fregWriteValid := False
     fregWriteReg   := 0
     fregWriteData  := 0
+    fregWritePc := 0
+    fregWriteStartCycle := 0
 
     when(input.valid && input.write){
       fregWriteValid := True
       fregWriteReg   := input.rd
+      fregWritePc := input.pc
+      fregWriteStartCycle := input.startCycle
       if(p.withDouble) {
         val sign = B(input.value.sign)
         val ieee = Bits(64 bits)
