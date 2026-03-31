@@ -76,6 +76,7 @@ case class VexRiscvConfig(){
   object LEGAL_INSTRUCTION extends Stageable(Bool)
   object REGFILE_WRITE_VALID extends Stageable(Bool)
   object REGFILE_WRITE_DATA extends Stageable(Bits(32 bits))
+  object LOG_START_CYCLE extends Stageable(UInt(64 bits))
 
   object MPP extends PipelineThing[UInt]
   object DEBUG_BYPASS_CACHE extends PipelineThing[Bool]
@@ -138,14 +139,22 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   val execute   = newStage()
   val memory    = ifGen(config.withMemoryStage)    (newStage())
   val writeBack = ifGen(config.withWriteBackStage) (newStage())
+  val simCycle = Reg(UInt(64 bits)) init(0)
 
   def stagesFromExecute = stages.dropWhile(_ != execute)
 
   plugins ++= config.plugins
+  simCycle := simCycle + 1
+  decode.insert(config.LOG_START_CYCLE) := simCycle + 1
 
   //regression usage
+  val executePc = CombInit(execute.input(config.PC)).dontSimplifyIt().setName("executePc").addAttribute(Verilator.public)
+  val executeIsFiring = CombInit(execute.arbitration.isFiring).dontSimplifyIt().setName("executeIsFiring").addAttribute(Verilator.public)
+  val memoryStagePc = CombInit(if(config.withMemoryStage) memory.input(config.PC) else execute.input(config.PC)).dontSimplifyIt().setName("memoryStagePc").addAttribute(Verilator.public)
+  val memoryStageStartCycle = CombInit(if(config.withMemoryStage) memory.input(config.LOG_START_CYCLE) else execute.input(config.LOG_START_CYCLE)).dontSimplifyIt().setName("memoryStageStartCycle").addAttribute(Verilator.public)
   val lastStageInstruction = CombInit(stages.last.input(config.INSTRUCTION)).dontSimplifyIt().addAttribute (Verilator.public)
   val lastStagePc = CombInit(stages.last.input(config.PC)).dontSimplifyIt().addAttribute(Verilator.public)
+  val lastStageStartCycle = CombInit(stages.last.input(config.LOG_START_CYCLE)).dontSimplifyIt().setName("lastStageStartCycle").addAttribute(Verilator.public)
   val lastStageIsValid = CombInit(stages.last.arbitration.isValid).dontSimplifyIt().addAttribute(Verilator.public)
   val lastStageIsFiring = CombInit(stages.last.arbitration.isFiring).dontSimplifyIt().addAttribute(Verilator.public)
 
@@ -156,5 +165,3 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   }
   execute.arbitration.flushNext.noBackendCombMerge
 }
-
-
