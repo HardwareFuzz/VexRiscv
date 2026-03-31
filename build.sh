@@ -103,9 +103,55 @@ esac
 OUT_BIN="${OUT_DIR}/vexriscv_${ISA,,}_${CORES}c${OUT_SUFFIX}"
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+java_major() {
+  local java_bin="$1"
+  local ver
+  ver="$("${java_bin}" -version 2>&1 | awk -F '"' '/version/ {print $2; exit}')"
+  [[ -n "${ver}" ]] || return 1
+  if [[ "${ver}" == 1.* ]]; then
+    printf '%s\n' "${ver#1.}" | cut -d. -f1
+  else
+    printf '%s\n' "${ver}" | cut -d. -f1
+  fi
+}
+
+select_java_for_sbt() {
+  local current_java=""
+  if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]]; then
+    current_java="${JAVA_HOME}/bin/java"
+  else
+    current_java="$(command -v java)"
+  fi
+
+  local current_major=""
+  current_major="$(java_major "${current_java}" 2>/dev/null || true)"
+  [[ -n "${current_major}" ]] || return 0
+
+  # sbt 1.6.0 is unstable on some JDK 21 setups; prefer JDK 17 when available.
+  if (( current_major >= 21 )); then
+    local candidate=""
+    local -a homes=()
+    [[ -n "${JAVA_17_HOME:-}" ]] && homes+=("${JAVA_17_HOME}")
+    [[ -d /usr/lib/jvm ]] && while IFS= read -r candidate; do
+      homes+=("${candidate}")
+    done < <(find /usr/lib/jvm -maxdepth 1 -type d \( -name 'java-17*' -o -name 'jdk-17*' \) | sort)
+
+    for candidate in "${homes[@]}"; do
+      if [[ -x "${candidate}/bin/java" ]]; then
+        export JAVA_HOME="${candidate}"
+        export PATH="${JAVA_HOME}/bin:${PATH}"
+        echo "[info] Using Java $(java_major "${JAVA_HOME}/bin/java") from ${JAVA_HOME} for sbt compatibility"
+        return 0
+      fi
+    done
+
+    echo "[warn] Java ${current_major} detected, but no JDK 17 candidate was found; continuing with current java" >&2
+  fi
+}
 
 command_exists verilator || die "verilator not found in PATH"
 command_exists java || die "java (JDK) not found in PATH"
+select_java_for_sbt
 
 SBT_CACHE_DIR="${ROOT_DIR}/.sbt-cache"
 SBT_CMD="${SBT_CMD:-${ROOT_DIR}/.sbtw}"
