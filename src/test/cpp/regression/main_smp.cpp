@@ -139,7 +139,15 @@ static void unpack_bytes_from_u32_words(const uint32_t words[4], uint8_t bytes[1
     }
 }
 
-static void log_mem_write_groups(FILE *f, uint64_t time, uint32_t pc, uint32_t base, const uint8_t bytes[16], uint16_t mask) {
+static void log_mem_write_groups(
+    FILE *f,
+    uint64_t time,
+    uint32_t pc,
+    uint32_t base,
+    const uint8_t bytes[16],
+    uint16_t mask,
+    uint64_t clk_start,
+    uint64_t clk_end) {
     // Group contiguous enabled bytes and emit one line per group.
     int i = 0;
     while (i < 16) {
@@ -161,16 +169,27 @@ static void log_mem_write_groups(FILE *f, uint64_t time, uint32_t pc, uint32_t b
         }
         std::fprintf(
             f,
-            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s\n",
+            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu\n",
             static_cast<unsigned long long>(time),
             static_cast<unsigned int>(pc),
             static_cast<unsigned int>(base + static_cast<uint32_t>(start)),
             len,
-            hex.c_str());
+            hex.c_str(),
+            static_cast<unsigned long long>(clk_start),
+            static_cast<unsigned long long>(clk_end),
+            static_cast<unsigned long long>(clk_end - clk_start + 1));
     }
 }
 
-static void log_mem_write_masked32(FILE *f, uint64_t time, uint32_t pc, uint32_t addr, uint32_t data, uint8_t mask) {
+static void log_mem_write_masked32(
+    FILE *f,
+    uint64_t time,
+    uint32_t pc,
+    uint32_t addr,
+    uint32_t data,
+    uint8_t mask,
+    uint64_t clk_start,
+    uint64_t clk_end) {
     uint8_t bytes[4];
     bytes[0] = static_cast<uint8_t>((data >> 0) & 0xFF);
     bytes[1] = static_cast<uint8_t>((data >> 8) & 0xFF);
@@ -196,12 +215,15 @@ static void log_mem_write_masked32(FILE *f, uint64_t time, uint32_t pc, uint32_t
         }
         std::fprintf(
             f,
-            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s\n",
+            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu\n",
             static_cast<unsigned long long>(time),
             static_cast<unsigned int>(pc),
             static_cast<unsigned int>(addr + static_cast<uint32_t>(start)),
             len,
-            hex.c_str());
+            hex.c_str(),
+            static_cast<unsigned long long>(clk_start),
+            static_cast<unsigned long long>(clk_end),
+            static_cast<unsigned long long>(clk_end - clk_start + 1));
     }
 }
 
@@ -221,6 +243,16 @@ static void toggle_debug_clock(VVexRiscv *top) {
     top->eval();
     top->debugCd_external_clk = 1;
     top->eval();
+}
+
+template <typename TCpu>
+static uint64_t current_clock_cycle(TCpu *cpu, uint64_t fallback_cycle) {
+    const uint64_t sim_cycle = static_cast<uint64_t>(cpu->__PVT__simCycle);
+    return sim_cycle != 0 ? sim_cycle : (fallback_cycle + 1);
+}
+
+static uint64_t normalize_start_cycle(uint64_t raw, uint64_t current) {
+    return raw != 0 ? raw : current;
 }
 
 int main(int argc, char **argv) {
@@ -433,40 +465,66 @@ int main(int argc, char **argv) {
         auto *cpu0 = soc->cores_0_cpu_logic_cpu;
         auto *cpu1 = soc->cores_1_cpu_logic_cpu;
 
-        // Register writes
-        if (cpu0->lastStageIsFiring && cpu0->lastStageRegFileWrite_valid && cpu0->lastStageRegFileWrite_payload_address != 0) {
-            std::fprintf(
-                reg_trace,
-                "%llu PC %08x : reg[%2u] = %08x\n",
-                static_cast<unsigned long long>(cycle),
-                static_cast<unsigned int>(cpu0->lastStagePc),
-                static_cast<unsigned int>(cpu0->lastStageRegFileWrite_payload_address),
-                static_cast<unsigned int>(cpu0->lastStageRegFileWrite_payload_data));
-        }
-        if (cpu1->lastStageIsFiring && cpu1->lastStageRegFileWrite_valid && cpu1->lastStageRegFileWrite_payload_address != 0) {
-            std::fprintf(
-                reg_trace,
-                "%llu PC %08x : reg[%2u] = %08x\n",
-                static_cast<unsigned long long>(cycle),
-                static_cast<unsigned int>(cpu1->lastStagePc),
-                static_cast<unsigned int>(cpu1->lastStageRegFileWrite_payload_address),
-                static_cast<unsigned int>(cpu1->lastStageRegFileWrite_payload_data));
-        }
+        // Register writes and timing-only commit lines.
+        auto log_commit = [&](auto *cpu) {
+            if (!cpu->lastStageIsFiring) return;
+
+            const uint64_t clk_end = current_clock_cycle(cpu, cycle);
+            const uint64_t clk_start =
+                normalize_start_cycle(static_cast<uint64_t>(cpu->lastStageStartCycle), clk_end);
+
+            if (cpu->lastStageRegFileWrite_valid &&
+                cpu->lastStageRegFileWrite_payload_address != 0) {
+                std::fprintf(
+                    reg_trace,
+                    "%llu PC %08x : reg[%2u] = %08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                    static_cast<unsigned long long>(cycle),
+                    static_cast<unsigned int>(cpu->lastStagePc),
+                    static_cast<unsigned int>(cpu->lastStageRegFileWrite_payload_address),
+                    static_cast<unsigned int>(cpu->lastStageRegFileWrite_payload_data),
+                    static_cast<unsigned long long>(clk_start),
+                    static_cast<unsigned long long>(clk_end),
+                    static_cast<unsigned long long>(clk_end - clk_start + 1));
+            } else {
+                std::fprintf(
+                    reg_trace,
+                    "%llu PC %08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                    static_cast<unsigned long long>(cycle),
+                    static_cast<unsigned int>(cpu->lastStagePc),
+                    static_cast<unsigned long long>(clk_start),
+                    static_cast<unsigned long long>(clk_end),
+                    static_cast<unsigned long long>(clk_end - clk_start + 1));
+            }
+        };
+        log_commit(cpu0);
+        log_commit(cpu1);
 
         // Exceptions
         if (cpu0->CsrPlugin_hadException) {
+            const uint64_t clk_end = current_clock_cycle(cpu0, cycle);
+            const uint64_t clk_start =
+                normalize_start_cycle(static_cast<uint64_t>(cpu0->lastStageStartCycle), clk_end);
             std::fprintf(
                 log_trace,
-                "EXC pc=0x%08x cause=%u\n",
+                "EXC pc=0x%08x cause=%u clk_start=%llu clk_end=%llu clk_span=%llu\n",
                 static_cast<unsigned int>(cpu0->lastStagePc),
-                static_cast<unsigned int>(cpu0->CsrPlugin_trapCause));
+                static_cast<unsigned int>(cpu0->CsrPlugin_trapCause),
+                static_cast<unsigned long long>(clk_start),
+                static_cast<unsigned long long>(clk_end),
+                static_cast<unsigned long long>(clk_end - clk_start + 1));
         }
         if (cpu1->CsrPlugin_hadException) {
+            const uint64_t clk_end = current_clock_cycle(cpu1, cycle);
+            const uint64_t clk_start =
+                normalize_start_cycle(static_cast<uint64_t>(cpu1->lastStageStartCycle), clk_end);
             std::fprintf(
                 log_trace,
-                "EXC pc=0x%08x cause=%u\n",
+                "EXC pc=0x%08x cause=%u clk_start=%llu clk_end=%llu clk_span=%llu\n",
                 static_cast<unsigned int>(cpu1->lastStagePc),
-                static_cast<unsigned int>(cpu1->CsrPlugin_trapCause));
+                static_cast<unsigned int>(cpu1->CsrPlugin_trapCause),
+                static_cast<unsigned long long>(clk_start),
+                static_cast<unsigned long long>(clk_end),
+                static_cast<unsigned long long>(clk_end - clk_start + 1));
         }
 
         // Memory writes (architectural stores) from the memory stage pipeline regs.
@@ -478,6 +536,10 @@ int main(int argc, char **argv) {
                 const uint32_t insn = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_INSTRUCTION);
                 const uint32_t addr = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_VIRTUAL_ADDRESS);
                 const uint32_t store_data = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_STORE_DATA_RF);
+                const uint64_t clk_end = current_clock_cycle(cpu, cycle);
+                const uint64_t clk_start = normalize_start_cycle(
+                    static_cast<uint64_t>(cpu->memoryStageStartCycle),
+                    clk_end);
 
                 const uint32_t opcode = insn & 0x7f;
                 const uint32_t funct3 = (insn >> 12) & 0x7;
@@ -504,7 +566,15 @@ int main(int argc, char **argv) {
                         }
                     }
                     if (mask != 0) {
-                        log_mem_write_masked32(mem_trace, cycle, pc, base, data_word, mask);
+                        log_mem_write_masked32(
+                            mem_trace,
+                            cycle,
+                            pc,
+                            base,
+                            data_word,
+                            mask,
+                            clk_start,
+                            clk_end);
                     }
                 }
             }

@@ -221,7 +221,7 @@ else
     rv32fd) smp_fpu="true" ;;
     *) die "internal: unexpected ISA for SMP build: ${ISA}" ;;
   esac
-  "${SBT_CMD}" "runMain ${SCALA_MAIN} --cpu-count 2 --netlist-name VexRiscv --netlist-directory . --fpu ${smp_fpu}"
+  "${SBT_CMD}" "runMain ${SCALA_MAIN} --cpu-count 2 --netlist-name VexRiscv --netlist-directory . --fpu ${smp_fpu} --rvc true"
 fi
 
 echo "[2/3] Verilator build: ${OUT_BIN}"
