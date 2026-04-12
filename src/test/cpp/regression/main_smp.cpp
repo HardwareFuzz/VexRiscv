@@ -8,6 +8,9 @@
 
 #include "VVexRiscv.h"
 #include "VVexRiscv_VexRiscv.h"
+#if defined(RVF) || defined(RVD)
+#include "VVexRiscv_FpuCore.h"
+#endif
 #include "VVexRiscv_VexRiscvCore_0.h"
 #include "VVexRiscv_VexRiscvCore_1.h"
 #include "verilated.h"
@@ -290,6 +293,15 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    FILE *freg_trace = nullptr;
+#if defined(RVF) || defined(RVD)
+    freg_trace = std::fopen("run.fregTrace", "w");
+    if (!freg_trace) {
+        std::perror("failed to open run.fregTrace");
+        return 2;
+    }
+#endif
+
     VVexRiscv *top = new VVexRiscv;
 
     FILE *log_trace = std::fopen("run.logTrace", "w");
@@ -498,6 +510,42 @@ int main(int argc, char **argv) {
         };
         log_commit(cpu0);
         log_commit(cpu1);
+
+#if defined(RVF) || defined(RVD)
+        if (soc->fpu_0_logic && soc->fpu_0_logic->fregWriteValid) {
+            const uint64_t cpu0_clk = current_clock_cycle(cpu0, cycle);
+            const uint64_t cpu1_clk = current_clock_cycle(cpu1, cycle);
+            const uint64_t fclk_end = cpu0_clk > cpu1_clk ? cpu0_clk : cpu1_clk;
+            const uint64_t fclk_start = normalize_start_cycle(
+                static_cast<uint64_t>(soc->fpu_0_logic->fregWriteStartCycle),
+                fclk_end);
+            const uint32_t fpc = soc->fpu_0_logic->fregWritePc;
+            const uint32_t frd_hw = soc->fpu_0_logic->fregWriteReg;
+#ifdef RVD
+            const uint64_t fval = soc->fpu_0_logic->fregWriteData;
+            std::fprintf(
+                freg_trace,
+                "PC %08x : f[%2u] = 0x%016llx clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                static_cast<unsigned int>(fpc),
+                static_cast<unsigned int>(frd_hw),
+                static_cast<unsigned long long>(fval),
+                static_cast<unsigned long long>(fclk_start),
+                static_cast<unsigned long long>(fclk_end),
+                static_cast<unsigned long long>(fclk_end - fclk_start + 1));
+#else
+            const uint32_t fval = static_cast<uint32_t>(soc->fpu_0_logic->fregWriteData);
+            std::fprintf(
+                freg_trace,
+                "PC %08x : f[%2u] = 0x%08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                static_cast<unsigned int>(fpc),
+                static_cast<unsigned int>(frd_hw),
+                static_cast<unsigned int>(fval),
+                static_cast<unsigned long long>(fclk_start),
+                static_cast<unsigned long long>(fclk_end),
+                static_cast<unsigned long long>(fclk_end - fclk_start + 1));
+#endif
+        }
+#endif
 
         // Exceptions
         if (cpu0->CsrPlugin_hadException) {
@@ -787,6 +835,11 @@ int main(int argc, char **argv) {
 
     std::fflush(reg_trace);
     std::fclose(reg_trace);
+
+#if defined(RVF) || defined(RVD)
+    std::fflush(freg_trace);
+    std::fclose(freg_trace);
+#endif
 
     std::fflush(log_trace);
     std::fclose(log_trace);
