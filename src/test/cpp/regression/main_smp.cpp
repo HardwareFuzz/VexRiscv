@@ -16,6 +16,7 @@
 #include "verilated.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -241,6 +242,207 @@ struct DramState {
     std::deque<DramReadResp> rdata_q;
 };
 
+struct PendingStore {
+    uint32_t hart_id;
+    uint32_t pc;
+    uint32_t insn;
+    uint32_t addr;
+    uint32_t expected_size;
+    uint64_t clk_start;
+    uint64_t clk_end;
+    uint64_t observed_cycle;
+};
+
+static uint32_t decode_store_size(uint32_t insn) {
+    if ((insn & 0x3u) != 0x3u) {
+        const uint32_t quadrant = insn & 0x3u;
+        const uint32_t funct3 = (insn >> 13) & 0x7u;
+        if (quadrant == 0u) {
+            if (funct3 == 0x5u) return 8u; // c.fsd
+            if (funct3 == 0x6u || funct3 == 0x7u) return 4u; // c.sw / c.fsw
+        } else if (quadrant == 2u) {
+            if (funct3 == 0x5u) return 8u; // c.fsdsp
+            if (funct3 == 0x6u || funct3 == 0x7u) return 4u; // c.swsp / c.fswsp
+        }
+        return 0u;
+    }
+
+    const uint32_t opcode = insn & 0x7fu;
+    const uint32_t funct3 = (insn >> 12) & 0x7u;
+    if (opcode == 0x23u) { // STORE
+        if (funct3 <= 3u) return 1u << funct3; // sb/sh/sw/sd
+        return 0u;
+    }
+    if (opcode == 0x27u || opcode == 0x2fu) { // STORE-FP / AMO/LRSC
+        if (funct3 == 0x2u) return 4u;
+        if (funct3 == 0x3u) return 8u;
+    }
+    return 0u;
+}
+
+static bool mask_span(uint16_t mask, uint32_t *start, uint32_t *len) {
+    uint32_t first = 16u;
+    uint32_t count = 0u;
+    uint32_t last = 0u;
+    for (uint32_t i = 0; i < 16u; ++i) {
+        if (((mask >> i) & 1u) == 0u) continue;
+        if (first == 16u) first = i;
+        last = i;
+        count++;
+    }
+    if (count == 0u) return false;
+    if (count != (last - first + 1u)) return false;
+    *start = first;
+    *len = count;
+    return true;
+}
+
+static void retire_stale_pending_stores(
+    std::deque<PendingStore> *pending_stores,
+    FILE *log_trace,
+    uint64_t cycle) {
+    static constexpr uint64_t kPendingStoreMaxAge = 256u;
+    while (!pending_stores->empty() &&
+           cycle > pending_stores->front().observed_cycle &&
+           (cycle - pending_stores->front().observed_cycle) > kPendingStoreMaxAge) {
+        const PendingStore &stale = pending_stores->front();
+        std::fprintf(
+            log_trace,
+            "WARN pending_store_timeout hart=%u pc=0x%08x addr=0x%08x size=%u observed=%llu now=%llu\n",
+            static_cast<unsigned int>(stale.hart_id),
+            static_cast<unsigned int>(stale.pc),
+            static_cast<unsigned int>(stale.addr),
+            static_cast<unsigned int>(stale.expected_size),
+            static_cast<unsigned long long>(stale.observed_cycle),
+            static_cast<unsigned long long>(cycle));
+        pending_stores->pop_front();
+    }
+}
+
+static bool emit_pending_store_write(
+    std::deque<PendingStore> *pending_stores,
+    FILE *mem_trace,
+    FILE *log_trace,
+    uint64_t cycle,
+    uint32_t base_addr,
+    const uint8_t bytes[16],
+    uint16_t mask) {
+    retire_stale_pending_stores(pending_stores, log_trace, cycle);
+
+    uint32_t span_start = 0u;
+    uint32_t span_len = 0u;
+    const bool contiguous = mask_span(mask, &span_start, &span_len);
+    if (!contiguous) {
+        std::fprintf(
+            log_trace,
+            "WARN pending_store_noncontiguous base=0x%08x mask=0x%04x cycle=%llu\n",
+            static_cast<unsigned int>(base_addr),
+            static_cast<unsigned int>(mask),
+            static_cast<unsigned long long>(cycle));
+    }
+
+    size_t best_index = pending_stores->size();
+    for (size_t i = 0; i < pending_stores->size(); ++i) {
+        const PendingStore &store = (*pending_stores)[i];
+        if (store.observed_cycle > cycle) continue;
+        if (!contiguous) continue;
+        if (store.expected_size != span_len) continue;
+        if (store.addr != (base_addr + span_start)) continue;
+        best_index = i;
+        break;
+    }
+
+    if (best_index == pending_stores->size() && contiguous) {
+        std::vector<size_t> covered_indices;
+        uint32_t cursor = base_addr + span_start;
+        const uint32_t span_end = cursor + span_len;
+        while (cursor < span_end) {
+            size_t covered_index = pending_stores->size();
+            for (size_t i = 0; i < pending_stores->size(); ++i) {
+                const PendingStore &store = (*pending_stores)[i];
+                if (store.observed_cycle > cycle) continue;
+                if (store.expected_size == 0u) continue;
+                if (store.addr != cursor) continue;
+                if (store.expected_size > (span_end - cursor)) continue;
+                covered_index = i;
+                break;
+            }
+            if (covered_index == pending_stores->size()) {
+                covered_indices.clear();
+                break;
+            }
+            covered_indices.push_back(covered_index);
+            cursor += (*pending_stores)[covered_index].expected_size;
+        }
+
+        if (!covered_indices.empty() && cursor == span_end) {
+            for (size_t covered_index : covered_indices) {
+                const PendingStore &matched = (*pending_stores)[covered_index];
+                const uint32_t offset = matched.addr - base_addr;
+                const uint16_t submask = static_cast<uint16_t>(
+                    ((1u << matched.expected_size) - 1u) << offset);
+                log_mem_write_groups(
+                    mem_trace,
+                    cycle,
+                    matched.pc,
+                    base_addr,
+                    bytes,
+                    submask,
+                    matched.clk_start,
+                    matched.clk_end);
+            }
+            for (auto it = covered_indices.rbegin(); it != covered_indices.rend(); ++it) {
+                pending_stores->erase(pending_stores->begin() + static_cast<std::ptrdiff_t>(*it));
+            }
+            return true;
+        }
+    }
+
+    if (best_index == pending_stores->size() && contiguous) {
+        for (size_t i = 0; i < pending_stores->size(); ++i) {
+            const PendingStore &store = (*pending_stores)[i];
+            if (store.observed_cycle > cycle) continue;
+            if (store.expected_size != span_len) continue;
+            if (store.addr < base_addr || store.addr >= (base_addr + 16u)) continue;
+            best_index = i;
+            break;
+        }
+    }
+
+    if (best_index == pending_stores->size()) {
+        std::fprintf(
+            log_trace,
+            "WARN pending_store_unmatched base=0x%08x mask=0x%04x cycle=%llu pending=%zu\n",
+            static_cast<unsigned int>(base_addr),
+            static_cast<unsigned int>(mask),
+            static_cast<unsigned long long>(cycle),
+            pending_stores->size());
+        log_mem_write_groups(
+            mem_trace,
+            cycle,
+            0u,
+            base_addr,
+            bytes,
+            mask,
+            cycle,
+            cycle);
+        return false;
+    }
+
+    const PendingStore matched = (*pending_stores)[best_index];
+    pending_stores->erase(pending_stores->begin() + static_cast<std::ptrdiff_t>(best_index));
+    log_mem_write_groups(
+        mem_trace,
+        cycle,
+        matched.pc,
+        base_addr,
+        bytes,
+        mask,
+        matched.clk_start,
+        matched.clk_end);
+    return true;
+}
+
 static void toggle_debug_clock(VVexRiscv *top) {
     top->debugCd_external_clk = 0;
     top->eval();
@@ -389,6 +591,7 @@ int main(int argc, char **argv) {
     // Per-core store edge tracking (memory stage can be held while back-pressured).
     uint8_t cpu0_store_prev = 0;
     uint8_t cpu1_store_prev = 0;
+    std::deque<PendingStore> pending_stores;
 
     // Extra visibility: capture if data/periph ever toggles.
     uint64_t d_cmd_seen = 0;
@@ -577,59 +780,44 @@ int main(int argc, char **argv) {
 
         // Memory writes (architectural stores) from the memory stage pipeline regs.
         // This avoids relying on internal dBus wiring which can be hidden behind cache/arb wrappers.
-        auto log_store = [&](auto *cpu, uint8_t &prev) {
+        auto log_store = [&](auto *cpu, uint32_t hart_id, uint8_t &prev) {
             const uint8_t is_store = (cpu->__PVT__memory_arbitration_isValid && cpu->__PVT__execute_to_memory_MEMORY_ENABLE && cpu->__PVT__execute_to_memory_MEMORY_WR) ? 1 : 0;
             if (is_store && !prev) {
                 const uint32_t pc = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_PC);
                 const uint32_t insn = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_INSTRUCTION);
                 const uint32_t addr = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_VIRTUAL_ADDRESS);
-                const uint32_t store_data = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_STORE_DATA_RF);
                 const uint64_t clk_end = current_clock_cycle(cpu, cycle);
                 const uint64_t clk_start = normalize_start_cycle(
                     static_cast<uint64_t>(cpu->memoryStageStartCycle),
                     clk_end);
+                const uint32_t expected_size = decode_store_size(insn);
 
-                const uint32_t opcode = insn & 0x7f;
-                const uint32_t funct3 = (insn >> 12) & 0x7;
-
-                if (opcode == 0x23) { // STORE
-                    const uint32_t base = addr & ~3u;
-                    const uint32_t byte_off = addr & 3u;
-                    uint8_t mask = 0;
-                    uint32_t data_word = 0;
-                    if (funct3 == 0x0) { // SB
-                        if (byte_off < 4) {
-                            mask = static_cast<uint8_t>(1u << byte_off);
-                            data_word = (store_data & 0xFFu) << (8u * byte_off);
-                        }
-                    } else if (funct3 == 0x1) { // SH
-                        if (byte_off <= 2) {
-                            mask = static_cast<uint8_t>(0x3u << byte_off);
-                            data_word = (store_data & 0xFFFFu) << (8u * byte_off);
-                        }
-                    } else if (funct3 == 0x2) { // SW
-                        if (byte_off == 0) {
-                            mask = 0xFu;
-                            data_word = store_data;
-                        }
-                    }
-                    if (mask != 0) {
-                        log_mem_write_masked32(
-                            mem_trace,
-                            cycle,
-                            pc,
-                            base,
-                            data_word,
-                            mask,
-                            clk_start,
-                            clk_end);
-                    }
+                if (expected_size != 0u) {
+                    pending_stores.push_back(PendingStore{
+                        hart_id,
+                        pc,
+                        insn,
+                        addr,
+                        expected_size,
+                        clk_start,
+                        clk_end,
+                        cycle,
+                    });
+                } else {
+                    std::fprintf(
+                        log_trace,
+                        "WARN unknown_store hart=%u pc=0x%08x insn=0x%08x addr=0x%08x cycle=%llu\n",
+                        static_cast<unsigned int>(hart_id),
+                        static_cast<unsigned int>(pc),
+                        static_cast<unsigned int>(insn),
+                        static_cast<unsigned int>(addr),
+                        static_cast<unsigned long long>(cycle));
                 }
             }
             prev = is_store;
         };
-        log_store(cpu0, cpu0_store_prev);
-        log_store(cpu1, cpu1_store_prev);
+        log_store(cpu0, 0u, cpu0_store_prev);
+        log_store(cpu1, 1u, cpu1_store_prev);
 
         // Consume read data if the DUT is ready.
         if (top->iBridge_dram_rdata_valid) {
@@ -681,6 +869,19 @@ int main(int argc, char **argv) {
             if (top->peripheral_WE) {
                 uint32_t wdata = static_cast<uint32_t>(top->peripheral_DAT_MOSI);
                 uint32_t sel = static_cast<uint32_t>(top->peripheral_SEL) & 0xF;
+                uint8_t bytes[16] = {};
+                bytes[0] = static_cast<uint8_t>((wdata >> 0) & 0xFFu);
+                bytes[1] = static_cast<uint8_t>((wdata >> 8) & 0xFFu);
+                bytes[2] = static_cast<uint8_t>((wdata >> 16) & 0xFFu);
+                bytes[3] = static_cast<uint8_t>((wdata >> 24) & 0xFFu);
+                emit_pending_store_write(
+                    &pending_stores,
+                    mem_trace,
+                    log_trace,
+                    cycle,
+                    addr,
+                    bytes,
+                    static_cast<uint16_t>(sel));
                 uint32_t merged = tohost_reg;
                 for (int b = 0; b < 4; b++) {
                     if ((sel >> b) & 1u) {
@@ -806,7 +1007,14 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < 16; i++) {
                     if ((mask >> i) & 1u) mem[addr + static_cast<uint32_t>(i)] = bytes[i];
                 }
-                // Keep functional memory updates; trace architectural stores via per-core dBus.
+                emit_pending_store_write(
+                    &pending_stores,
+                    mem_trace,
+                    log_trace,
+                    cycle,
+                    addr,
+                    bytes,
+                    mask);
             }
         }
 
@@ -829,6 +1037,19 @@ int main(int argc, char **argv) {
         static_cast<unsigned long long>(periph_count),
         static_cast<unsigned long long>(wdata_i_count),
         static_cast<unsigned long long>(wdata_d_count));
+    while (!pending_stores.empty()) {
+        const PendingStore &stale = pending_stores.front();
+        std::fprintf(
+            log_trace,
+            "WARN pending_store_leftover hart=%u pc=0x%08x addr=0x%08x size=%u observed=%llu done_cycle=%llu\n",
+            static_cast<unsigned int>(stale.hart_id),
+            static_cast<unsigned int>(stale.pc),
+            static_cast<unsigned int>(stale.addr),
+            static_cast<unsigned int>(stale.expected_size),
+            static_cast<unsigned long long>(stale.observed_cycle),
+            static_cast<unsigned long long>(cycle));
+        pending_stores.pop_front();
+    }
 
     std::fflush(mem_trace);
     std::fclose(mem_trace);
