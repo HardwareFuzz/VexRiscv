@@ -291,6 +291,22 @@ public:
 	u64 value;
 };
 
+class FpuTraceCommit{
+public:
+	u32 opcode;
+	u64 value;
+};
+
+class FpuTraceWrite{
+public:
+	u32 pc;
+	u64 clkStart;
+	u64 clkEnd;
+	u32 reg;
+	bool isDouble;
+	u64 data;
+};
+
 class FpuCompletion{
 public:
 	u32 flags;
@@ -300,6 +316,8 @@ public:
 bool fpuCommitLut[32] = {true,true,true,true,true,true,false,false,true,false,false,true,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,true,false};
 bool fpuRspLut[32] = {false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,true,false,false,false,true,false,false,false};
 bool fpuRs1Lut[32] = {false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,true,false};
+static constexpr u32 FPU_OPCODE_LOAD = 0;
+static constexpr u32 FPU_OPCODE_FMV_W_X = 13;
 class RiscvGolden {
 public:
 	int32_t pc, lastPc;
@@ -312,7 +330,7 @@ public:
 	uint32_t privilege;
 
     uint32_t medeleg;
-	uint32_t mideleg;
+    uint32_t mideleg;
 
     queue<FpuRsp> fpuRsp;
     queue<FpuCommit> fpuCommit;
@@ -1349,6 +1367,8 @@ public:
 	ofstream memTraces;
 	ofstream logTraces;
 	ofstream fregTraces;
+	queue<FpuTraceCommit> fpuTraceCommit;
+	queue<FpuTraceWrite> fpuTraceWrite;
 
 	uint64_t currentClockCycle() const {
 		return instanceCycles + 1;
@@ -1809,6 +1829,10 @@ public:
 				if(VEX_CPU->writeBack_FpuPlugin_commit_valid &&
 				   VEX_CPU->writeBack_FpuPlugin_commit_ready &&
 				   VEX_CPU->writeBack_FpuPlugin_commit_payload_write){
+					FpuTraceCommit traceCommit;
+					traceCommit.opcode = VEX_CPU->writeBack_FpuPlugin_commit_payload_opcode;
+					traceCommit.value = VEX_CPU->writeBack_FpuPlugin_commit_payload_value;
+					fpuTraceCommit.push(traceCommit);
 
 					if(riscvRefEnable){
 						FpuCommit c;
@@ -1819,19 +1843,47 @@ public:
 
 				// Architectural F-register writeback trace from FpuCore, tagged with
 				// the original instruction metadata carried through the FPU pipeline.
+				// Use the FPU commit payload for the actual value: it carries the
+				// architectural IEEE/boxed bits, while fregWriteData is a debug view
+				// reconstructed from internal floating fields and can mis-encode
+				// bitwise moves or subnormal payloads.
 				if(VEX_CPU->FpuPlugin_fpu && VEX_CPU->FpuPlugin_fpu->fregWriteValid){
-					uint32_t fpc = VEX_CPU->FpuPlugin_fpu->fregWritePc;
-					uint64_t fclkStart = normalizeStartCycle(VEX_CPU->FpuPlugin_fpu->fregWriteStartCycle);
-					uint64_t fclkEnd = currentClockCycle();
-					uint32_t frdHw  = VEX_CPU->FpuPlugin_fpu->fregWriteReg;
+					FpuTraceWrite traceWrite;
+					traceWrite.pc = VEX_CPU->FpuPlugin_fpu->fregWritePc;
+					traceWrite.clkStart = normalizeStartCycle(VEX_CPU->FpuPlugin_fpu->fregWriteStartCycle);
+					traceWrite.clkEnd = currentClockCycle();
+					traceWrite.reg = VEX_CPU->FpuPlugin_fpu->fregWriteReg;
 					#ifdef RVD
-					uint64_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					traceWrite.isDouble = VEX_CPU->FpuPlugin_fpu->fregWriteIsDouble;
+					traceWrite.data = VEX_CPU->FpuPlugin_fpu->fregWriteData;
 					#else
-					uint32_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					traceWrite.isDouble = false;
+					traceWrite.data = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					#endif
+					fpuTraceWrite.push(traceWrite);
+				}
+
+				while(!fpuTraceWrite.empty() && !fpuTraceCommit.empty()){
+					FpuTraceWrite traceWrite = fpuTraceWrite.front();
+					fpuTraceWrite.pop();
+					FpuTraceCommit traceCommit = fpuTraceCommit.front();
+					fpuTraceCommit.pop();
+					bool useCommitValue =
+						traceCommit.opcode == FPU_OPCODE_LOAD ||
+						traceCommit.opcode == FPU_OPCODE_FMV_W_X;
+					#ifdef RVD
+					uint64_t fval = traceWrite.data;
+					if(useCommitValue){
+						fval = traceWrite.isDouble
+							? traceCommit.value
+							: (0xFFFFFFFF00000000ULL | (uint32_t)traceCommit.value);
+					}
+					#else
+					uint32_t fval = useCommitValue ? traceCommit.value : traceWrite.data;
 					#endif
 					fregTraces
-						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
-						<< " : f[" << std::dec << std::setw(2) << (uint32_t)frdHw
+						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << traceWrite.pc
+						<< " : f[" << std::dec << std::setw(2) << (uint32_t)traceWrite.reg
 						<< "] = 0x" << std::hex
 						#ifdef RVD
 						<< std::setw(16)
@@ -1840,9 +1892,9 @@ public:
 						#endif
 						<< std::setfill('0') << fval
 						<< std::dec << std::setfill(' ')
-						<< " clk_start=" << fclkStart
-						<< " clk_end=" << fclkEnd
-						<< " clk_span=" << (fclkEnd - fclkStart + 1)
+						<< " clk_start=" << traceWrite.clkStart
+						<< " clk_end=" << traceWrite.clkEnd
+						<< " clk_span=" << (traceWrite.clkEnd - traceWrite.clkStart + 1)
 						<< std::endl;
 				}
 

@@ -1722,18 +1722,21 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val fregWriteData  = p.storeLoadType().setName("fregWriteData").addAttribute(Verilator.public)
     val fregWritePc = UInt(32 bits).setName("fregWritePc").addAttribute(Verilator.public)
     val fregWriteStartCycle = UInt(64 bits).setName("fregWriteStartCycle").addAttribute(Verilator.public)
+    val fregWriteIsDouble = p.withDouble generate Bool().setName("fregWriteIsDouble").addAttribute(Verilator.public)
 
     fregWriteValid := False
     fregWriteReg   := 0
     fregWriteData  := 0
     fregWritePc := 0
     fregWriteStartCycle := 0
+    if(p.withDouble) fregWriteIsDouble := False
 
     when(input.valid && input.write){
       fregWriteValid := True
       fregWriteReg   := input.rd
       fregWritePc := input.pc
       fregWriteStartCycle := input.startCycle
+      if(p.withDouble) fregWriteIsDouble := input.format === FpuFormat.DOUBLE
       if(p.withDouble) {
         val sign = B(input.value.sign)
         val ieee = Bits(64 bits)

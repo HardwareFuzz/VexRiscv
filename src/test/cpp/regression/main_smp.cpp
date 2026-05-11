@@ -497,11 +497,27 @@ int main(int argc, char **argv) {
 
     FILE *freg_trace = nullptr;
 #if defined(RVF) || defined(RVD)
+    static constexpr uint32_t kFpuOpcodeLoad = 0;
+    static constexpr uint32_t kFpuOpcodeFmvWX = 13;
+    struct FpuTraceCommit {
+        uint32_t opcode;
+        uint64_t value;
+    };
     freg_trace = std::fopen("run.fregTrace", "w");
     if (!freg_trace) {
         std::perror("failed to open run.fregTrace");
         return 2;
     }
+    struct FpuTraceWrite {
+        uint32_t pc;
+        uint64_t clk_start;
+        uint64_t clk_end;
+        uint32_t reg;
+        bool is_double;
+        uint64_t data;
+    };
+    std::deque<FpuTraceCommit> fpu_trace_commits;
+    std::deque<FpuTraceWrite> fpu_trace_writes;
 #endif
 
     VVexRiscv *top = new VVexRiscv;
@@ -715,38 +731,67 @@ int main(int argc, char **argv) {
         log_commit(cpu1);
 
 #if defined(RVF) || defined(RVD)
+        if (cpu0->writeBack_FpuPlugin_commit_valid &&
+            cpu0->writeBack_FpuPlugin_commit_ready &&
+            cpu0->writeBack_FpuPlugin_commit_payload_write) {
+            fpu_trace_commits.push_back(FpuTraceCommit{
+                static_cast<uint32_t>(cpu0->writeBack_FpuPlugin_commit_payload_opcode),
+                static_cast<uint64_t>(cpu0->writeBack_FpuPlugin_commit_payload_value),
+            });
+        }
         if (soc->fpu_0_logic && soc->fpu_0_logic->fregWriteValid) {
             const uint64_t cpu0_clk = current_clock_cycle(cpu0, cycle);
             const uint64_t cpu1_clk = current_clock_cycle(cpu1, cycle);
             const uint64_t fclk_end = cpu0_clk > cpu1_clk ? cpu0_clk : cpu1_clk;
-            const uint64_t fclk_start = normalize_start_cycle(
-                static_cast<uint64_t>(soc->fpu_0_logic->fregWriteStartCycle),
-                fclk_end);
-            const uint32_t fpc = soc->fpu_0_logic->fregWritePc;
-            const uint32_t frd_hw = soc->fpu_0_logic->fregWriteReg;
+            FpuTraceWrite trace_write = {
+                static_cast<uint32_t>(soc->fpu_0_logic->fregWritePc),
+                normalize_start_cycle(
+                    static_cast<uint64_t>(soc->fpu_0_logic->fregWriteStartCycle),
+                    fclk_end),
+                fclk_end,
+                static_cast<uint32_t>(soc->fpu_0_logic->fregWriteReg),
+                static_cast<bool>(soc->fpu_0_logic->fregWriteIsDouble),
+                static_cast<uint64_t>(soc->fpu_0_logic->fregWriteData),
+            };
+            fpu_trace_writes.push_back(trace_write);
+        }
+        while (!fpu_trace_commits.empty() && !fpu_trace_writes.empty()) {
+            const FpuTraceCommit trace_commit = fpu_trace_commits.front();
+            const FpuTraceWrite trace_write = fpu_trace_writes.front();
+            const bool use_commit_value =
+                trace_commit.opcode == kFpuOpcodeLoad ||
+                trace_commit.opcode == kFpuOpcodeFmvWX;
 #ifdef RVD
-            const uint64_t fval = soc->fpu_0_logic->fregWriteData;
+            const uint64_t fval = use_commit_value
+                ? (trace_write.is_double
+                    ? trace_commit.value
+                    : (0xFFFFFFFF00000000ULL | static_cast<uint32_t>(trace_commit.value)))
+                : trace_write.data;
             std::fprintf(
                 freg_trace,
                 "PC %08x : f[%2u] = 0x%016llx clk_start=%llu clk_end=%llu clk_span=%llu\n",
-                static_cast<unsigned int>(fpc),
-                static_cast<unsigned int>(frd_hw),
+                static_cast<unsigned int>(trace_write.pc),
+                static_cast<unsigned int>(trace_write.reg),
                 static_cast<unsigned long long>(fval),
-                static_cast<unsigned long long>(fclk_start),
-                static_cast<unsigned long long>(fclk_end),
-                static_cast<unsigned long long>(fclk_end - fclk_start + 1));
+                static_cast<unsigned long long>(trace_write.clk_start),
+                static_cast<unsigned long long>(trace_write.clk_end),
+                static_cast<unsigned long long>(trace_write.clk_end - trace_write.clk_start + 1));
 #else
-            const uint32_t fval = static_cast<uint32_t>(soc->fpu_0_logic->fregWriteData);
+            const uint32_t fval = use_commit_value
+                ? static_cast<uint32_t>(trace_commit.value)
+                : static_cast<uint32_t>(trace_write.data);
             std::fprintf(
                 freg_trace,
                 "PC %08x : f[%2u] = 0x%08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
-                static_cast<unsigned int>(fpc),
-                static_cast<unsigned int>(frd_hw),
+                static_cast<unsigned int>(trace_write.pc),
+                static_cast<unsigned int>(trace_write.reg),
                 static_cast<unsigned int>(fval),
-                static_cast<unsigned long long>(fclk_start),
-                static_cast<unsigned long long>(fclk_end),
-                static_cast<unsigned long long>(fclk_end - fclk_start + 1));
+                static_cast<unsigned long long>(trace_write.clk_start),
+                static_cast<unsigned long long>(trace_write.clk_end),
+                static_cast<unsigned long long>(trace_write.clk_end - trace_write.clk_start + 1));
 #endif
+            fpu_trace_commits.pop_front();
+            fpu_trace_writes.pop_front();
         }
 #endif
 
