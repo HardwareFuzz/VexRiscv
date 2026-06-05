@@ -3,14 +3,14 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh --isa <rv32|rv32f|rv32fd> --cores N [--out-dir DIR] [--coverage|--coverage-light|--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
+Usage: ./build.sh --isa <rv32f|rv32fd> --cores N [--out-dir DIR] [--coverage|--coverage-light|--no-coverage] [--clean] [--help] [-- extra_verilator_args...]
 
 Build a Verilator-based VexRiscv simulator that accepts an ELF/HEX path.
 
 Options:
-  --isa <rv32|rv32f|rv32fd>   ISA selection (RV64 is unsupported; will error)
+  --isa <rv32f|rv32fd>        ISA selection (RV64 is unsupported; will error)
   --cores N                  Number of cores (supported: 1 or 2)
-                             Note: SMP 2-core supports rv32 and rv32fd only (rv32f is unsupported).
+                             Note: SMP 2-core supports rv32fd only.
   --out-dir DIR              Output directory for the final binary (default: ./build_result)
                              You can also set CX_OUT_DIR (shared across repos) or OUT_DIR.
   --coverage                 Enable Verilator full coverage (suffix _cov)
@@ -26,8 +26,8 @@ Output artifact:
 Examples:
   ./build.sh --isa rv32fd --cores 1
   ./build.sh --isa rv32f --cores 1 --coverage-light
-  ./build.sh --isa rv32 --cores 1 -- --compiler clang
-  ./build.sh --isa rv32 --cores 2
+  ./build.sh --isa rv32fd --cores 1 -- --compiler clang
+  ./build.sh --isa rv32fd --cores 2
 EOF
 }
 
@@ -85,9 +85,9 @@ if (( CORES > 2 )); then
 fi
 
 case "${ISA,,}" in
-  rv32|rv32f|rv32fd) ;;
+  rv32f|rv32fd) ;;
   rv64|rv64*|riscv64|riscv64*) die "RV64 is unsupported in this repo" ;;
-  *) die "unsupported --isa '${ISA}' (supported: rv32 rv32f rv32fd)" ;;
+  *) die "unsupported --isa '${ISA}' (supported: rv32f rv32fd)" ;;
 esac
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -180,10 +180,6 @@ SCALA_MAIN=""
 RVF="no"
 RVD="no"
 case "${ISA,,}" in
-  rv32)
-    SCALA_MAIN="vexriscv.demo.GenMaxRv32"
-    RVF="no"; RVD="no"
-    ;;
   rv32f)
     SCALA_MAIN="vexriscv.demo.GenMaxRv32F"
     RVF="yes"; RVD="no"
@@ -196,7 +192,7 @@ esac
 
 if (( CORES == 2 )); then
   if [[ "${ISA,,}" == "rv32f" ]]; then
-    die "SMP 2-core build does not support --isa rv32f (use rv32 or rv32fd)"
+    die "SMP 2-core build does not support --isa rv32f (use rv32fd)"
   fi
   SCALA_MAIN="vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen"
 fi
@@ -217,7 +213,6 @@ if (( CORES == 1 )); then
 else
   smp_fpu="false"
   case "${ISA,,}" in
-    rv32) smp_fpu="false" ;;
     rv32fd) smp_fpu="true" ;;
     *) die "internal: unexpected ISA for SMP build: ${ISA}" ;;
   esac
