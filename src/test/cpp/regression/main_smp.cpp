@@ -236,9 +236,14 @@ struct DramReadResp {
     uint32_t words[4];
 };
 
+struct DramWriteCmd {
+    uint32_t addr;
+    uint32_t source;
+};
+
 struct DramState {
     // Writes are split cmd + wdata; preserve cmd order until wdata arrives.
-    std::deque<uint32_t> write_addr_q;
+    std::deque<DramWriteCmd> write_addr_q;
     std::deque<DramReadResp> rdata_q;
 };
 
@@ -248,6 +253,7 @@ struct PendingStore {
     uint32_t insn;
     uint32_t addr;
     uint32_t expected_size;
+    bool suppress_bus_log;
     uint64_t clk_start;
     uint64_t clk_end;
     uint64_t observed_cycle;
@@ -278,6 +284,49 @@ static uint32_t decode_store_size(uint32_t insn) {
         if (funct3 == 0x3u) return 8u;
     }
     return 0u;
+}
+
+static bool is_direct_integer_store(uint32_t insn) {
+    if ((insn & 0x3u) != 0x3u) {
+        const uint32_t quadrant = insn & 0x3u;
+        const uint32_t funct3 = (insn >> 13) & 0x7u;
+        if (quadrant == 0u && funct3 == 0x6u) return true; // c.sw
+        if (quadrant == 2u && funct3 == 0x6u) return true; // c.swsp
+        return false;
+    }
+    return (insn & 0x7fu) == 0x23u; // integer STORE
+}
+
+static void log_direct_store_write(
+    FILE *mem_trace,
+    uint64_t cycle,
+    uint32_t pc,
+    uint32_t addr,
+    uint32_t size,
+    uint32_t data,
+    uint64_t clk_start,
+    uint64_t clk_end) {
+    if (size == 0u || size > 4u) return;
+    const uint32_t mask = size == 4u ? 0xffffffffu : ((1u << (size * 8u)) - 1u);
+    const uint32_t masked_data = data & mask;
+    char hex[9];
+    std::snprintf(
+        hex,
+        sizeof(hex),
+        "%0*x",
+        static_cast<int>(size * 2u),
+        static_cast<unsigned int>(masked_data));
+    std::fprintf(
+        mem_trace,
+        "%llu PC %08x : MEM[0x%08x] <= %u bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu\n",
+        static_cast<unsigned long long>(cycle),
+        static_cast<unsigned int>(pc),
+        static_cast<unsigned int>(addr),
+        static_cast<unsigned int>(size),
+        hex,
+        static_cast<unsigned long long>(clk_start),
+        static_cast<unsigned long long>(clk_end),
+        static_cast<unsigned long long>(clk_end - clk_start + 1));
 }
 
 static bool mask_span(uint16_t mask, uint32_t *start, uint32_t *len) {
@@ -326,7 +375,9 @@ static bool emit_pending_store_write(
     uint64_t cycle,
     uint32_t base_addr,
     const uint8_t bytes[16],
-    uint16_t mask) {
+    uint16_t mask,
+    bool prefer_hart,
+    uint32_t hart_id) {
     retire_stale_pending_stores(pending_stores, log_trace, cycle);
 
     uint32_t span_start = 0u;
@@ -341,55 +392,129 @@ static bool emit_pending_store_write(
             static_cast<unsigned long long>(cycle));
     }
 
+    auto exact_match = [&](bool same_hart_only) -> size_t {
+        if (same_hart_only) {
+            for (int prefer_suppressed = 0; prefer_suppressed <= 1; ++prefer_suppressed) {
+                for (size_t i = 0; i < pending_stores->size(); ++i) {
+                    const PendingStore &store = (*pending_stores)[i];
+                    if (store.observed_cycle > cycle) continue;
+                    if (!contiguous) continue;
+                    if (store.expected_size != span_len) continue;
+                    if (store.addr != (base_addr + span_start)) continue;
+                    if (store.hart_id != hart_id) continue;
+                    if (store.suppress_bus_log != static_cast<bool>(prefer_suppressed)) continue;
+                    return i;
+                }
+            }
+        } else {
+            for (int prefer_suppressed = 0; prefer_suppressed <= 1; ++prefer_suppressed) {
+                for (size_t i = pending_stores->size(); i-- > 0;) {
+                    const PendingStore &store = (*pending_stores)[i];
+                    if (store.observed_cycle > cycle) continue;
+                    if (!contiguous) continue;
+                    if (store.expected_size != span_len) continue;
+                    if (store.addr != (base_addr + span_start)) continue;
+                    if (store.suppress_bus_log != static_cast<bool>(prefer_suppressed)) continue;
+                    return i;
+                }
+            }
+        }
+        return pending_stores->size();
+    };
+
     size_t best_index = pending_stores->size();
-    for (size_t i = 0; i < pending_stores->size(); ++i) {
-        const PendingStore &store = (*pending_stores)[i];
-        if (store.observed_cycle > cycle) continue;
-        if (!contiguous) continue;
-        if (store.expected_size != span_len) continue;
-        if (store.addr != (base_addr + span_start)) continue;
-        best_index = i;
-        break;
+    // The shared dBridge/peripheral writeback path is not strictly ordered by
+    // source-PC age when the two harts interleave AMO/LRSC traffic to the same
+    // word. Prefer the most recently observed compatible pending store so later
+    // same-address atomics do not get back-attributed to earlier init stores.
+    if (prefer_hart) {
+        best_index = exact_match(true);
+    }
+    if (best_index == pending_stores->size()) {
+        best_index = exact_match(false);
     }
 
     if (best_index == pending_stores->size() && contiguous) {
+        auto covered_match = [&](bool same_hart_only) -> std::vector<size_t> {
+            std::vector<size_t> covered_indices;
+            uint32_t cursor = base_addr + span_start;
+            const uint32_t span_end = cursor + span_len;
+            while (cursor < span_end) {
+                size_t covered_index = pending_stores->size();
+                if (same_hart_only) {
+                    for (int prefer_suppressed = 0; prefer_suppressed <= 1 && covered_index == pending_stores->size(); ++prefer_suppressed) {
+                        for (size_t i = 0; i < pending_stores->size(); ++i) {
+                            const PendingStore &store = (*pending_stores)[i];
+                            if (store.observed_cycle > cycle) continue;
+                            if (store.expected_size == 0u) continue;
+                            if (store.addr != cursor) continue;
+                            if (store.expected_size > (span_end - cursor)) continue;
+                            if (store.hart_id != hart_id) continue;
+                            if (store.suppress_bus_log != static_cast<bool>(prefer_suppressed)) continue;
+                            covered_index = i;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int prefer_suppressed = 0; prefer_suppressed <= 1 && covered_index == pending_stores->size(); ++prefer_suppressed) {
+                        for (size_t i = pending_stores->size(); i-- > 0;) {
+                            const PendingStore &store = (*pending_stores)[i];
+                            if (store.observed_cycle > cycle) continue;
+                            if (store.expected_size == 0u) continue;
+                            if (store.addr != cursor) continue;
+                            if (store.expected_size > (span_end - cursor)) continue;
+                            if (store.suppress_bus_log != static_cast<bool>(prefer_suppressed)) continue;
+                            covered_index = i;
+                            break;
+                        }
+                    }
+                }
+                if (covered_index == pending_stores->size()) {
+                    covered_indices.clear();
+                    break;
+                }
+                covered_indices.push_back(covered_index);
+                cursor += (*pending_stores)[covered_index].expected_size;
+            }
+            if (covered_indices.empty() || cursor != span_end) return {};
+            return covered_indices;
+        };
+
         std::vector<size_t> covered_indices;
-        uint32_t cursor = base_addr + span_start;
-        const uint32_t span_end = cursor + span_len;
-        while (cursor < span_end) {
-            size_t covered_index = pending_stores->size();
-            for (size_t i = 0; i < pending_stores->size(); ++i) {
-                const PendingStore &store = (*pending_stores)[i];
-                if (store.observed_cycle > cycle) continue;
-                if (store.expected_size == 0u) continue;
-                if (store.addr != cursor) continue;
-                if (store.expected_size > (span_end - cursor)) continue;
-                covered_index = i;
-                break;
-            }
-            if (covered_index == pending_stores->size()) {
-                covered_indices.clear();
-                break;
-            }
-            covered_indices.push_back(covered_index);
-            cursor += (*pending_stores)[covered_index].expected_size;
+        if (prefer_hart) {
+            covered_indices = covered_match(true);
+        }
+        if (covered_indices.empty()) {
+            covered_indices = covered_match(false);
         }
 
-        if (!covered_indices.empty() && cursor == span_end) {
+        if (!covered_indices.empty()) {
             for (size_t covered_index : covered_indices) {
                 const PendingStore &matched = (*pending_stores)[covered_index];
                 const uint32_t offset = matched.addr - base_addr;
                 const uint16_t submask = static_cast<uint16_t>(
                     ((1u << matched.expected_size) - 1u) << offset);
-                log_mem_write_groups(
-                    mem_trace,
-                    cycle,
-                    matched.pc,
-                    base_addr,
-                    bytes,
-                    submask,
-                    matched.clk_start,
-                    matched.clk_end);
+                std::fprintf(
+                    log_trace,
+                    "TRACE pending_store_match kind=covered base=0x%08x cycle=%llu req_hart=%u matched_hart=%u pc=0x%08x size=%u mask=0x%04x\n",
+                    static_cast<unsigned int>(base_addr),
+                    static_cast<unsigned long long>(cycle),
+                    static_cast<unsigned int>(hart_id),
+                    static_cast<unsigned int>(matched.hart_id),
+                    static_cast<unsigned int>(matched.pc),
+                    static_cast<unsigned int>(matched.expected_size),
+                    static_cast<unsigned int>(submask));
+                if (!matched.suppress_bus_log) {
+                    log_mem_write_groups(
+                        mem_trace,
+                        cycle,
+                        matched.pc,
+                        base_addr,
+                        bytes,
+                        submask,
+                        matched.clk_start,
+                        matched.clk_end);
+                }
             }
             for (auto it = covered_indices.rbegin(); it != covered_indices.rend(); ++it) {
                 pending_stores->erase(pending_stores->begin() + static_cast<std::ptrdiff_t>(*it));
@@ -399,24 +524,51 @@ static bool emit_pending_store_write(
     }
 
     if (best_index == pending_stores->size() && contiguous) {
-        for (size_t i = 0; i < pending_stores->size(); ++i) {
-            const PendingStore &store = (*pending_stores)[i];
-            if (store.observed_cycle > cycle) continue;
-            if (store.expected_size != span_len) continue;
-            if (store.addr < base_addr || store.addr >= (base_addr + 16u)) continue;
-            best_index = i;
-            break;
+        auto same_line_match = [&](bool same_hart_only) -> size_t {
+            if (same_hart_only) {
+                for (int prefer_suppressed = 0; prefer_suppressed <= 1; ++prefer_suppressed) {
+                    for (size_t i = 0; i < pending_stores->size(); ++i) {
+                        const PendingStore &store = (*pending_stores)[i];
+                        if (store.observed_cycle > cycle) continue;
+                        if (store.expected_size != span_len) continue;
+                        if (store.addr < base_addr || store.addr >= (base_addr + 16u)) continue;
+                        if (store.hart_id != hart_id) continue;
+                        if (store.suppress_bus_log != static_cast<bool>(prefer_suppressed)) continue;
+                        return i;
+                    }
+                }
+            } else {
+                for (int prefer_suppressed = 0; prefer_suppressed <= 1; ++prefer_suppressed) {
+                    for (size_t i = pending_stores->size(); i-- > 0;) {
+                        const PendingStore &store = (*pending_stores)[i];
+                        if (store.observed_cycle > cycle) continue;
+                        if (store.expected_size != span_len) continue;
+                        if (store.addr < base_addr || store.addr >= (base_addr + 16u)) continue;
+                        if (store.suppress_bus_log != static_cast<bool>(prefer_suppressed)) continue;
+                        return i;
+                    }
+                }
+            }
+            return pending_stores->size();
+        };
+        if (prefer_hart) {
+            best_index = same_line_match(true);
+        }
+        if (best_index == pending_stores->size()) {
+            best_index = same_line_match(false);
         }
     }
 
     if (best_index == pending_stores->size()) {
         std::fprintf(
             log_trace,
-            "WARN pending_store_unmatched base=0x%08x mask=0x%04x cycle=%llu pending=%zu\n",
+            "WARN pending_store_unmatched base=0x%08x mask=0x%04x cycle=%llu pending=%zu prefer_hart=%u hart=%u\n",
             static_cast<unsigned int>(base_addr),
             static_cast<unsigned int>(mask),
             static_cast<unsigned long long>(cycle),
-            pending_stores->size());
+            pending_stores->size(),
+            static_cast<unsigned int>(prefer_hart ? 1u : 0u),
+            static_cast<unsigned int>(hart_id));
         log_mem_write_groups(
             mem_trace,
             cycle,
@@ -431,15 +583,29 @@ static bool emit_pending_store_write(
 
     const PendingStore matched = (*pending_stores)[best_index];
     pending_stores->erase(pending_stores->begin() + static_cast<std::ptrdiff_t>(best_index));
-    log_mem_write_groups(
-        mem_trace,
-        cycle,
-        matched.pc,
-        base_addr,
-        bytes,
-        mask,
-        matched.clk_start,
-        matched.clk_end);
+    std::fprintf(
+        log_trace,
+        "TRACE pending_store_match kind=single base=0x%08x cycle=%llu req_hart=%u matched_hart=%u pc=0x%08x size=%u mask=0x%04x prefer_hart=%u suppress=%u\n",
+        static_cast<unsigned int>(base_addr),
+        static_cast<unsigned long long>(cycle),
+        static_cast<unsigned int>(hart_id),
+        static_cast<unsigned int>(matched.hart_id),
+        static_cast<unsigned int>(matched.pc),
+        static_cast<unsigned int>(matched.expected_size),
+        static_cast<unsigned int>(mask),
+        static_cast<unsigned int>(prefer_hart ? 1u : 0u),
+        static_cast<unsigned int>(matched.suppress_bus_log ? 1u : 0u));
+    if (!matched.suppress_bus_log) {
+        log_mem_write_groups(
+            mem_trace,
+            cycle,
+            matched.pc,
+            base_addr,
+            bytes,
+            mask,
+            matched.clk_start,
+            matched.clk_end);
+    }
     return true;
 }
 
@@ -838,12 +1004,25 @@ int main(int argc, char **argv) {
                 const uint32_t expected_size = decode_store_size(insn);
 
                 if (expected_size != 0u) {
+                    const bool direct_integer_store = is_direct_integer_store(insn);
+                    if (direct_integer_store) {
+                        log_direct_store_write(
+                            mem_trace,
+                            cycle,
+                            pc,
+                            addr,
+                            expected_size,
+                            static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_STORE_DATA_RF),
+                            clk_start,
+                            clk_end);
+                    }
                     pending_stores.push_back(PendingStore{
                         hart_id,
                         pc,
                         insn,
                         addr,
                         expected_size,
+                        direct_integer_store,
                         clk_start,
                         clk_end,
                         cycle,
@@ -926,7 +1105,9 @@ int main(int argc, char **argv) {
                     cycle,
                     addr,
                     bytes,
-                    static_cast<uint16_t>(sel));
+                    static_cast<uint16_t>(sel),
+                    false,
+                    0u);
                 uint32_t merged = tohost_reg;
                 for (int b = 0; b < 4; b++) {
                     if ((sel >> b) & 1u) {
@@ -966,7 +1147,7 @@ int main(int argc, char **argv) {
             }
             i_cmd_count++;
             if (we) {
-                i_dram.write_addr_q.push_back(addr);
+                i_dram.write_addr_q.push_back(DramWriteCmd{addr, 0u});
             } else {
                 uint8_t bytes[16];
                 for (int i = 0; i < 16; i++) bytes[i] = mem[addr + static_cast<uint32_t>(i)];
@@ -986,8 +1167,9 @@ int main(int argc, char **argv) {
             }
             wdata_i_count++;
             if (!i_dram.write_addr_q.empty()) {
-                uint32_t addr = i_dram.write_addr_q.front();
+                DramWriteCmd write_cmd = i_dram.write_addr_q.front();
                 i_dram.write_addr_q.pop_front();
+                uint32_t addr = write_cmd.addr;
                 uint32_t words[4] = {
                     static_cast<uint32_t>(top->iBridge_dram_wdata_payload_data[0]),
                     static_cast<uint32_t>(top->iBridge_dram_wdata_payload_data[1]),
@@ -1011,14 +1193,20 @@ int main(int argc, char **argv) {
             if (d_cmd_count < 200) {
                 std::fprintf(
                     log_trace,
-                    "time=%llu d_cmd addr=0x%08x we=%u\n",
+                    "time=%llu d_cmd addr=0x%08x we=%u source=%u\n",
                     static_cast<unsigned long long>(cycle),
                     static_cast<unsigned int>(addr),
-                    static_cast<unsigned int>(we ? 1 : 0));
+                    static_cast<unsigned int>(we ? 1 : 0),
+                    static_cast<unsigned int>(
+                        soc->__PVT__dBridge_bmb_slaveModel_arbiterGen_oneToOne_arbiter_cmd_s2mPipe_payload_fragment_source));
             }
             d_cmd_count++;
             if (we) {
-                d_dram.write_addr_q.push_back(addr);
+                d_dram.write_addr_q.push_back(DramWriteCmd{
+                    addr,
+                    static_cast<uint32_t>(
+                        soc->__PVT__dBridge_bmb_slaveModel_arbiterGen_oneToOne_arbiter_cmd_s2mPipe_payload_fragment_source),
+                });
             } else {
                 uint8_t bytes[16];
                 for (int i = 0; i < 16; i++) bytes[i] = mem[addr + static_cast<uint32_t>(i)];
@@ -1038,8 +1226,9 @@ int main(int argc, char **argv) {
             }
             wdata_d_count++;
             if (!d_dram.write_addr_q.empty()) {
-                uint32_t addr = d_dram.write_addr_q.front();
+                DramWriteCmd write_cmd = d_dram.write_addr_q.front();
                 d_dram.write_addr_q.pop_front();
+                uint32_t addr = write_cmd.addr;
                 uint32_t words[4] = {
                     static_cast<uint32_t>(top->dBridge_dram_wdata_payload_data[0]),
                     static_cast<uint32_t>(top->dBridge_dram_wdata_payload_data[1]),
@@ -1059,7 +1248,9 @@ int main(int argc, char **argv) {
                     cycle,
                     addr,
                     bytes,
-                    mask);
+                    mask,
+                    true,
+                    write_cmd.source);
             }
         }
 
