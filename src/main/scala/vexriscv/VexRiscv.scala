@@ -76,7 +76,11 @@ case class VexRiscvConfig(){
   object LEGAL_INSTRUCTION extends Stageable(Bool)
   object REGFILE_WRITE_VALID extends Stageable(Bool)
   object REGFILE_WRITE_DATA extends Stageable(Bits(32 bits))
+  // CX trace v2 metadata.  These values are allocated once when the decode
+  // instruction is accepted and are then carried by the normal pipeline
+  // registers.  LOG_TOKEN is unique within one hart (VexRiscv instance).
   object LOG_START_CYCLE extends Stageable(UInt(64 bits))
+  object LOG_TOKEN extends Stageable(UInt(64 bits))
 
   object MPP extends PipelineThing[UInt]
   object DEBUG_BYPASS_CACHE extends PipelineThing[Bool]
@@ -140,23 +144,72 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   val memory    = ifGen(config.withMemoryStage)    (newStage())
   val writeBack = ifGen(config.withWriteBackStage) (newStage())
   val simCycle = Reg(UInt(64 bits)) init(0)
+  val nextTraceToken = Reg(UInt(64 bits)) init(0)
+  // A cache/MMU redo redirects the PC back to an instruction that has already
+  // been accepted by decode.  Keep that instruction's original allocation
+  // metadata outside the flushed pipeline so every retry remains one dynamic
+  // architectural instruction in CXTRACE.
+  val replayTraceValid = Reg(Bool) init(False)
+  val replayTracePc = Reg(UInt(32 bits)) init(0)
+  val replayTraceInstruction = Reg(Bits(32 bits)) init(0)
+  val replayTraceStartCycle = Reg(UInt(64 bits)) init(0)
+  val replayTraceToken = Reg(UInt(64 bits)) init(0)
+  // CsrPlugin asserts this only on the cycle in which a synchronous decode
+  // exception is accepted. Such an entry terminates precisely without ever
+  // firing into execute, but it still needs to consume the token exposed on
+  // the decode sidecar.
+  val decodeTraceExceptionAlloc = False
 
   def stagesFromExecute = stages.dropWhile(_ != execute)
 
   plugins ++= config.plugins
   simCycle := simCycle + 1
-  decode.insert(config.LOG_START_CYCLE) := simCycle + 1
+  // simCycle is zero while reset is asserted, so the value sampled by a
+  // decode allocation on the first post-reset rising edge is exactly one.
+  val decodeTraceReplayMatch = replayTraceValid &&
+    decode.input(config.PC) === replayTracePc &&
+    decode.input(config.FORMAL_INSTRUCTION) === replayTraceInstruction
+  decode.insert(config.LOG_START_CYCLE) := decodeTraceReplayMatch ? replayTraceStartCycle | (simCycle + 1)
+  decode.insert(config.LOG_TOKEN) := decodeTraceReplayMatch ? replayTraceToken | nextTraceToken
+  // Normal instructions allocate only when decode formally enters execute.
+  // A synchronous exception detected in decode is the one exception: the CSR
+  // exception controller accepts it as an architectural terminal directly,
+  // so its exact acceptance pulse must consume the token as well. Branch
+  // flushes and ordinary stalls do neither.
+  val decodeTraceAlloc = decode.arbitration.isFiring || decodeTraceExceptionAlloc
+  when(decodeTraceAlloc) {
+    when(decodeTraceReplayMatch) {
+      replayTraceValid := False
+    } otherwise {
+      nextTraceToken := nextTraceToken + 1
+    }
+  }
 
   //regression usage
+  val traceCycle = CombInit(simCycle).dontSimplifyIt().setName("traceCycle").addAttribute(Verilator.public)
+  val decodeTraceIsAllocating = CombInit(decodeTraceAlloc).dontSimplifyIt().setName("decodeTraceIsAllocating").addAttribute(Verilator.public)
+  val decodeTraceIsReusingReplay = CombInit(decodeTraceAlloc && decodeTraceReplayMatch).dontSimplifyIt().setName("decodeTraceIsReusingReplay").addAttribute(Verilator.public)
   val executePc = CombInit(execute.input(config.PC)).dontSimplifyIt().setName("executePc").addAttribute(Verilator.public)
   val executeIsFiring = CombInit(execute.arbitration.isFiring).dontSimplifyIt().setName("executeIsFiring").addAttribute(Verilator.public)
   val memoryStagePc = CombInit(if(config.withMemoryStage) memory.input(config.PC) else execute.input(config.PC)).dontSimplifyIt().setName("memoryStagePc").addAttribute(Verilator.public)
   val memoryStageStartCycle = CombInit(if(config.withMemoryStage) memory.input(config.LOG_START_CYCLE) else execute.input(config.LOG_START_CYCLE)).dontSimplifyIt().setName("memoryStageStartCycle").addAttribute(Verilator.public)
+  val memoryStageToken = CombInit(if(config.withMemoryStage) memory.input(config.LOG_TOKEN) else execute.input(config.LOG_TOKEN)).dontSimplifyIt().setName("memoryStageToken").addAttribute(Verilator.public)
   val lastStageInstruction = CombInit(stages.last.input(config.INSTRUCTION)).dontSimplifyIt().addAttribute (Verilator.public)
+  val lastStageRawInstruction = CombInit(stages.last.input(config.FORMAL_INSTRUCTION)).dontSimplifyIt().setName("lastStageRawInstruction").addAttribute(Verilator.public)
+  val lastStageIsRvc = CombInit(if(config.withRvc) stages.last.input(config.IS_RVC) else False).dontSimplifyIt().setName("lastStageIsRvc").addAttribute(Verilator.public)
   val lastStagePc = CombInit(stages.last.input(config.PC)).dontSimplifyIt().addAttribute(Verilator.public)
   val lastStageStartCycle = CombInit(stages.last.input(config.LOG_START_CYCLE)).dontSimplifyIt().setName("lastStageStartCycle").addAttribute(Verilator.public)
+  val lastStageToken = CombInit(stages.last.input(config.LOG_TOKEN)).dontSimplifyIt().setName("lastStageToken").addAttribute(Verilator.public)
   val lastStageIsValid = CombInit(stages.last.arbitration.isValid).dontSimplifyIt().addAttribute(Verilator.public)
   val lastStageIsFiring = CombInit(stages.last.arbitration.isFiring).dontSimplifyIt().addAttribute(Verilator.public)
+
+  // A committed instruction must always carry metadata sampled at allocation.
+  // These assertions are simulation-visible and catch accidental zero/default
+  // metadata or a future cycle-domain regression immediately.
+  when(stages.last.arbitration.isFiring) {
+    assert(stages.last.input(config.LOG_START_CYCLE) =/= 0)
+    assert(stages.last.input(config.LOG_START_CYCLE) <= simCycle)
+  }
 
   //Verilator perf
   decode.arbitration.removeIt.noBackendCombMerge

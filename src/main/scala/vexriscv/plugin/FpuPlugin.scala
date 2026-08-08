@@ -285,6 +285,7 @@ class FpuPlugin(externalFpu : Boolean = false,
       port.cmd.rd        := input(INSTRUCTION)(rdRange).asUInt
       port.cmd.pc        := input(PC)
       port.cmd.startCycle:= input(LOG_START_CYCLE)
+      port.cmd.traceToken:= input(LOG_TOKEN)
       port.cmd.format    := (if(p.withDouble) input(FPU_FORMAT) else FpuFormat.FLOAT())
       port.cmd.roundMode := roundMode.as(FpuRoundMode())
 
@@ -362,6 +363,7 @@ class FpuPlugin(externalFpu : Boolean = false,
         port.cmd.rd := access.regId
         port.cmd.pc := 0
         port.cmd.startCycle := 0
+        port.cmd.traceToken := 0
         port.cmd.format := access.size.muxListDc(List(
           2 -> FpuFormat.FLOAT(),
           3 -> FpuFormat.DOUBLE()

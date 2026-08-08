@@ -159,6 +159,7 @@ case class FpuCmd(p : FpuParameter) extends Bundle{
   val rd = p.rfAddress()
   val pc = UInt(32 bits)
   val startCycle = UInt(64 bits)
+  val traceToken = UInt(64 bits)
   val format = p.Format()
   val roundMode = FpuRoundMode()
 }

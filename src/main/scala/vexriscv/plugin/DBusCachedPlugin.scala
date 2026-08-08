@@ -546,10 +546,35 @@ class DBusCachedPlugin(val config : DataCacheConfig,
         }
 
         when(cache.io.cpu.redo) {
+          // Preserve the first allocation across cache/MMU retry redirects.
+          // The redirected copy will consume this sidecar in decode and will
+          // therefore carry the same token and start cycle through every redo.
+          pipeline.replayTraceValid := True
+          pipeline.replayTracePc := input(PC)
+          pipeline.replayTraceInstruction := input(FORMAL_INSTRUCTION)
+          pipeline.replayTraceStartCycle := input(LOG_START_CYCLE)
+          pipeline.replayTraceToken := input(LOG_TOKEN)
           redoBranch.valid := True
           if(catchSomething) exceptionBus.valid := False
         }
       }
+
+      // Regression-harness sidecar for the architectural store accepted at
+      // the terminal stage.  Unlike external cache-line traffic, these fields
+      // retain the exact originating instruction and its token.
+      val traceStoreCommit = CombInit(
+        arbitration.isFiring && input(MEMORY_ENABLE) && input(MEMORY_WR) &&
+          (if(withLrSc) !input(MEMORY_LRSC) || cache.io.cpu.writeBack.exclusiveOk else True)
+      ).dontSimplifyIt().setName("traceStoreCommit").addAttribute(Verilator.public)
+      val traceStoreAddress = CombInit(cache.io.cpu.writeBack.address)
+        .dontSimplifyIt().setName("traceStoreAddress").addAttribute(Verilator.public)
+      // requestDataBypass contains the final AMO result (and the normal/FPU
+      // store payload otherwise), whereas writeBack.storeData is still the
+      // AMO source operand.
+      val traceStoreData = CombInit(cache.io.cpu.writeBack.committedStoreData)
+        .dontSimplifyIt().setName("traceStoreData").addAttribute(Verilator.public)
+      val traceStoreSize = CombInit(input(INSTRUCTION)(13 downto 12).asUInt)
+        .dontSimplifyIt().setName("traceStoreSize").addAttribute(Verilator.public)
 
       arbitration.haltItself.setWhen(cache.io.cpu.writeBack.isValid && cache.io.cpu.writeBack.haltIt)
 

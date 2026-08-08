@@ -22,6 +22,7 @@
 #include <mutex>
 #include <iomanip>
 #include <queue>
+#include <unordered_map>
 #include <time.h>
 #include "encoding.h"
 #include <unistd.h>
@@ -38,6 +39,16 @@
 #endif
 
 using namespace std;
+
+static const char *cxTraceIsa() {
+#ifdef RVD
+	return "rv32fd";
+#elif defined(RVF)
+	return "rv32f";
+#else
+	return "rv32";
+#endif
+}
 
 #if VM_COVERAGE
 static std::string g_cov_path;
@@ -291,6 +302,29 @@ public:
 	u64 value;
 };
 
+class FpuTraceCommit{
+public:
+	u32 opcode;
+	u64 value;
+};
+
+class FpuTraceWrite{
+public:
+	u32 pc;
+	u64 clkStart;
+	u64 token;
+	u64 writebackCycle;
+	u32 reg;
+	bool isDouble;
+	u64 data;
+};
+
+class TerminalTrace{
+public:
+	u64 clkStart;
+	u64 clkEnd;
+};
+
 class FpuCompletion{
 public:
 	u32 flags;
@@ -300,6 +334,8 @@ public:
 bool fpuCommitLut[32] = {true,true,true,true,true,true,false,false,true,false,false,true,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,true,false};
 bool fpuRspLut[32] = {false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,true,false,false,false,true,false,false,false};
 bool fpuRs1Lut[32] = {false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,true,false};
+static constexpr u32 FPU_OPCODE_LOAD = 0;
+static constexpr u32 FPU_OPCODE_FMV_W_X = 13;
 class RiscvGolden {
 public:
 	int32_t pc, lastPc;
@@ -1349,9 +1385,17 @@ public:
 	ofstream memTraces;
 	ofstream logTraces;
 	ofstream fregTraces;
+	ofstream cxTraces;
+	queue<FpuTraceCommit> fpuTraceCommit;
+	queue<FpuTraceWrite> fpuTraceWrite;
+	unordered_map<uint64_t, TerminalTrace> terminalTraceByToken;
+	uint64_t termSeq = 0;
+	uint64_t instretSeq = 0;
+	bool interruptTraceWasHigh = false;
 
 	uint64_t currentClockCycle() const {
-		return instanceCycles + 1;
+		const uint64_t traceCycle = static_cast<uint64_t>(VEX_CPU->traceCycle);
+		return traceCycle != 0 ? traceCycle : (instanceCycles + 1);
 	}
 
 	uint64_t normalizeStartCycle(uint64_t raw) const {
@@ -1511,6 +1555,17 @@ public:
 		#endif
 		logTraces.open (name + ".logTrace");
 		fregTraces.open(name + ".fregTrace");
+		cxTraces.open(name + ".cxTrace");
+		cxTraces << "trace_version=2\n"
+		         << "cycle_domain=core_ref_clk\n"
+		         << "cycle_base=first_post_reset_posedge_is_1\n"
+		         << "interval=inclusive\n"
+		         << "start_kind=backend_alloc\n"
+		         << "end_kind=arch_commit_or_precise_trap\n"
+		         << "core=VexRiscv\n"
+		         << "harts=1\n"
+		         << "isa=" << cxTraceIsa() << "\n"
+		         << "build_config=regression_1c\n";
 		fillSimELements();
 		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start_time);
 	}
@@ -1809,6 +1864,10 @@ public:
 				if(VEX_CPU->writeBack_FpuPlugin_commit_valid &&
 				   VEX_CPU->writeBack_FpuPlugin_commit_ready &&
 				   VEX_CPU->writeBack_FpuPlugin_commit_payload_write){
+					FpuTraceCommit traceCommit;
+					traceCommit.opcode = VEX_CPU->writeBack_FpuPlugin_commit_payload_opcode;
+					traceCommit.value = VEX_CPU->writeBack_FpuPlugin_commit_payload_value;
+					fpuTraceCommit.push(traceCommit);
 
 					if(riscvRefEnable){
 						FpuCommit c;
@@ -1819,19 +1878,51 @@ public:
 
 				// Architectural F-register writeback trace from FpuCore, tagged with
 				// the original instruction metadata carried through the FPU pipeline.
+				// Use the FPU commit payload for the actual value: it carries the
+				// architectural IEEE/boxed bits, while fregWriteData is a debug view
+				// reconstructed from internal floating fields and can mis-encode
+				// bitwise moves or subnormal payloads.
 				if(VEX_CPU->FpuPlugin_fpu && VEX_CPU->FpuPlugin_fpu->fregWriteValid){
-					uint32_t fpc = VEX_CPU->FpuPlugin_fpu->fregWritePc;
-					uint64_t fclkStart = normalizeStartCycle(VEX_CPU->FpuPlugin_fpu->fregWriteStartCycle);
-					uint64_t fclkEnd = currentClockCycle();
-					uint32_t frdHw  = VEX_CPU->FpuPlugin_fpu->fregWriteReg;
+					FpuTraceWrite traceWrite;
+					traceWrite.pc = VEX_CPU->FpuPlugin_fpu->fregWritePc;
+					traceWrite.clkStart = normalizeStartCycle(VEX_CPU->FpuPlugin_fpu->fregWriteStartCycle);
+					traceWrite.token = VEX_CPU->FpuPlugin_fpu->fregWriteToken;
+					traceWrite.writebackCycle = currentClockCycle();
+					traceWrite.reg = VEX_CPU->FpuPlugin_fpu->fregWriteReg;
 					#ifdef RVD
-					uint64_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					traceWrite.isDouble = VEX_CPU->FpuPlugin_fpu->fregWriteIsDouble;
+					traceWrite.data = VEX_CPU->FpuPlugin_fpu->fregWriteData;
 					#else
-					uint32_t fval = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					traceWrite.isDouble = false;
+					traceWrite.data = VEX_CPU->FpuPlugin_fpu->fregWriteData;
+					#endif
+					fpuTraceWrite.push(traceWrite);
+				}
+
+				while(!fpuTraceWrite.empty() && !fpuTraceCommit.empty()){
+					FpuTraceWrite traceWrite = fpuTraceWrite.front();
+					auto terminalIt = terminalTraceByToken.find(traceWrite.token);
+					if(terminalIt == terminalTraceByToken.end()) break;
+					const TerminalTrace terminalTrace = terminalIt->second;
+					fpuTraceWrite.pop();
+					FpuTraceCommit traceCommit = fpuTraceCommit.front();
+					fpuTraceCommit.pop();
+					bool useCommitValue =
+						traceCommit.opcode == FPU_OPCODE_LOAD ||
+						traceCommit.opcode == FPU_OPCODE_FMV_W_X;
+					#ifdef RVD
+					uint64_t fval = traceWrite.data;
+					if(useCommitValue){
+						fval = traceWrite.isDouble
+							? traceCommit.value
+							: (0xFFFFFFFF00000000ULL | (uint32_t)traceCommit.value);
+					}
+					#else
+					uint32_t fval = useCommitValue ? traceCommit.value : traceWrite.data;
 					#endif
 					fregTraces
-						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << fpc
-						<< " : f[" << std::dec << std::setw(2) << (uint32_t)frdHw
+						<< "PC " << std::hex << std::setw(8) << std::setfill('0') << traceWrite.pc
+						<< " : f[" << std::dec << std::setw(2) << (uint32_t)traceWrite.reg
 						<< "] = 0x" << std::hex
 						#ifdef RVD
 						<< std::setw(16)
@@ -1840,10 +1931,19 @@ public:
 						#endif
 						<< std::setfill('0') << fval
 						<< std::dec << std::setfill(' ')
-						<< " clk_start=" << fclkStart
-						<< " clk_end=" << fclkEnd
-						<< " clk_span=" << (fclkEnd - fclkStart + 1)
+						<< " clk_start=" << terminalTrace.clkStart
+						<< " clk_end=" << terminalTrace.clkEnd
+						<< " clk_span=" << (terminalTrace.clkEnd - terminalTrace.clkStart + 1)
+						<< " hart=0 token=" << traceWrite.token
+						<< " event=writeback writeback_cycle=" << traceWrite.writebackCycle
+						<< " start_kind=backend_alloc end_kind=arch_commit"
 						<< std::endl;
+					cxTraces
+						<< "CXTRACE v=2 event=writeback core=VexRiscv hart=0 token=" << traceWrite.token
+						<< " cycle=" << traceWrite.writebackCycle
+						<< " rd_kind=f rd=" << (uint32_t)traceWrite.reg
+						<< std::endl;
+					terminalTraceByToken.erase(terminalIt);
 				}
 
 				if(riscvRefEnable){
@@ -1868,9 +1968,64 @@ public:
                 #endif
 
 
-                if(VEX_CPU->lastStageIsFiring){
-                	uint64_t clkEnd = currentClockCycle();
-                	uint64_t clkStart = normalizeStartCycle(VEX_CPU->lastStageStartCycle);
+				if(VEX_CPU->lastStageIsFiring){
+					uint64_t clkEnd = currentClockCycle();
+					uint64_t clkStart = VEX_CPU->lastStageStartCycle;
+					uint64_t traceToken = VEX_CPU->lastStageToken;
+					uint32_t traceInsnLen = VEX_CPU->lastStageIsRvc ? 2u : 4u;
+					uint32_t traceInsn = VEX_CPU->lastStageRawInstruction;
+					if(traceInsnLen == 2u) traceInsn &= 0xffffu;
+					uint32_t tracePriv = VEX_CPU->traceCommitPrivilege;
+					#ifdef RVF
+					if(VEX_CPU->writeBack_FpuPlugin_commit_valid &&
+					   VEX_CPU->writeBack_FpuPlugin_commit_ready &&
+					   VEX_CPU->writeBack_FpuPlugin_commit_payload_write){
+						terminalTraceByToken[traceToken] = TerminalTrace{clkStart, clkEnd};
+					}
+					#endif
+					cxTraces
+						<< "CXTRACE v=2 event=inst_terminal core=VexRiscv hart=0"
+						<< " token=" << traceToken
+						<< " term_seq=" << termSeq
+						<< " instret_seq=" << instretSeq
+						<< " commit_slot=0 pc=0x" << hex << VEX_CPU->lastStagePc
+						<< " insn=0x" << traceInsn << dec
+						<< " insn_len=" << traceInsnLen
+						<< " start_cycle=" << clkStart
+						<< " end_cycle=" << clkEnd
+						<< " span=" << (clkEnd - clkStart + 1)
+						<< " start_kind=backend_alloc end_kind=arch_commit"
+						<< " retired=1 trap=0 cause=none priv=" << tracePriv
+						<< endl;
+					#ifdef TRACE_ACCESS
+					// Attribute architectural memory side effects at the same WB
+					// acceptance that emits the terminal record. External dBus
+					// traffic may be a delayed cache-line eviction and has no
+					// trustworthy instruction identity.
+					if(VEX_CPU->traceStoreCommit){
+						const uint32_t storeSize = 1u << static_cast<uint32_t>(VEX_CPU->traceStoreSize);
+						const uint64_t storeMask = storeSize == 8u
+							? UINT64_MAX
+							: ((1ULL << (storeSize * 8u)) - 1ULL);
+						const uint64_t storeData = static_cast<uint64_t>(VEX_CPU->traceStoreData) & storeMask;
+						memTraces
+							<< clkEnd
+							<< " PC " << hex << setw(8) << setfill('0') << VEX_CPU->lastStagePc
+							<< " : MEM[0x" << setw(8) << VEX_CPU->traceStoreAddress << "] <= "
+							<< dec << storeSize << " bytes : 0x"
+							<< hex << setw(static_cast<int>(storeSize * 2u)) << storeData
+							<< dec << setfill(' ')
+							<< " clk_start=" << clkStart
+							<< " clk_end=" << clkEnd
+							<< " clk_span=" << (clkEnd - clkStart + 1)
+							<< " hart=0 token=" << traceToken
+							<< " token_valid=1 event=arch_store"
+							<< " start_kind=backend_alloc end_kind=arch_commit"
+							<< endl;
+					}
+					#endif
+					termSeq++;
+					instretSeq++;
                    	if(riscvRefEnable) {
 //                        privilegeCounters[riscvRef.privilege]++;
 //                        if((riscvRef.stepCounter & 0xFFFFF) == 0){
@@ -1907,7 +2062,10 @@ public:
                              " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << " : reg[" << dec << setw(2) << (uint32_t)VEX_CPU->lastStageRegFileWrite_payload_address << "] = " << hex << setw(8) << VEX_CPU->lastStageRegFileWrite_payload_data <<  dec
                              << " clk_start=" << clkStart
                              << " clk_end=" << clkEnd
-                             << " clk_span=" << (clkEnd - clkStart + 1) << endl;
+                             << " clk_span=" << (clkEnd - clkStart + 1)
+                             << " hart=0 token=" << traceToken
+                             << " commit_slot=0 retired=1 trap=0 event=inst_terminal"
+                             << " start_kind=backend_alloc end_kind=arch_commit" << endl;
                         #endif
                     } else {
                         #ifdef TRACE_ACCESS
@@ -1918,7 +2076,10 @@ public:
                                  " PC " << hex << setw(8) <<  VEX_CPU->lastStagePc << dec
                                  << " clk_start=" << clkStart
                                  << " clk_end=" << clkEnd
-                                 << " clk_span=" << (clkEnd - clkStart + 1) << endl;
+                                 << " clk_span=" << (clkEnd - clkStart + 1)
+                                 << " hart=0 token=" << traceToken
+                                 << " commit_slot=0 retired=1 trap=0 event=inst_terminal"
+                                 << " start_kind=backend_alloc end_kind=arch_commit" << endl;
                         #endif
                     }
 					if(riscvRefEnable) if(rfWriteValid != riscvRef.rfWriteValid ||
@@ -1931,29 +2092,67 @@ public:
                 }
 
                 #ifdef CSR
-                    if(VEX_CPU->CsrPlugin_hadException){
-                        uint64_t clkEnd = currentClockCycle();
-                        uint64_t clkStart = normalizeStartCycle(VEX_CPU->lastStageStartCycle);
+					if(VEX_CPU->CsrPlugin_hadException){
+						uint64_t clkEnd = currentClockCycle();
+						uint64_t clkStart = VEX_CPU->CsrPlugin_exceptionPortCtrl_exceptionTraceStartCycle;
+						uint64_t traceToken = VEX_CPU->CsrPlugin_exceptionPortCtrl_exceptionTraceToken;
+						uint32_t tracePc = VEX_CPU->CsrPlugin_exceptionPortCtrl_exceptionTracePc;
+						uint32_t traceInsnLen = VEX_CPU->CsrPlugin_exceptionPortCtrl_exceptionTraceIsRvc ? 2u : 4u;
+						uint32_t traceInsn = VEX_CPU->CsrPlugin_exceptionPortCtrl_exceptionTraceInstruction;
+						if(traceInsnLen == 2u) traceInsn &= 0xffffu;
+						uint32_t traceCause = VEX_CPU->CsrPlugin_trapCause;
+						uint32_t tracePriv = VEX_CPU->CsrPlugin_exceptionPortCtrl_exceptionTracePrivilege;
                         // Log exception PC and RISC-V exception cause code (stdout + run.logTrace)
                         std::cout << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
-                                  << VEX_CPU->lastStagePc
+						          << tracePc
                                   << " cause=" << std::dec << (unsigned)VEX_CPU->CsrPlugin_trapCause
-                                  << " clk_start=" << clkStart
-                                  << " clk_end=" << clkEnd
-                                  << " clk_span=" << (clkEnd - clkStart + 1)
+						          << " clk_start=" << clkStart
+						          << " clk_end=" << clkEnd
+						          << " clk_span=" << (clkEnd - clkStart + 1)
+						          << " hart=0 token=" << traceToken
+						          << " commit_slot=0 retired=0 trap=1 event=inst_terminal"
+						          << " start_kind=backend_alloc end_kind=precise_trap"
                                   << std::setfill(' ') << std::endl;
-                        logTraces << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
-                                  << VEX_CPU->lastStagePc
+						logTraces << "EXC pc=0x" << std::hex << std::setw(8) << std::setfill('0')
+						          << tracePc
                                   << " cause=" << std::dec << (unsigned)VEX_CPU->CsrPlugin_trapCause
-                                  << " clk_start=" << clkStart
-                                  << " clk_end=" << clkEnd
-                                  << " clk_span=" << (clkEnd - clkStart + 1)
-                                  << std::setfill(' ') << std::endl;
+						          << " clk_start=" << clkStart
+						          << " clk_end=" << clkEnd
+						          << " clk_span=" << (clkEnd - clkStart + 1)
+						          << " hart=0 token=" << traceToken
+						          << " commit_slot=0 retired=0 trap=1 event=inst_terminal"
+						          << " start_kind=backend_alloc end_kind=precise_trap"
+						          << std::setfill(' ') << std::endl;
+						cxTraces
+							<< "CXTRACE v=2 event=inst_terminal core=VexRiscv hart=0"
+							<< " token=" << traceToken
+							<< " term_seq=" << termSeq
+							<< " instret_seq=-"
+							<< " commit_slot=0 pc=0x" << hex << tracePc
+							<< " insn=0x" << traceInsn << dec
+							<< " insn_len=" << traceInsnLen
+							<< " start_cycle=" << clkStart
+							<< " end_cycle=" << clkEnd
+							<< " span=" << (clkEnd - clkStart + 1)
+							<< " start_kind=backend_alloc end_kind=precise_trap"
+							<< " retired=0 trap=1 cause=" << traceCause
+							<< " priv=" << tracePriv << endl;
+						termSeq++;
                         if(riscvRefEnable) {
                             riscvRef.step();
                         }
-                    }
-                #endif
+					}
+					const bool interruptTraceHigh = VEX_CPU->CsrPlugin_interruptJump;
+					if(interruptTraceHigh && !interruptTraceWasHigh){
+						cxTraces
+							<< "CXTRACE v=2 event=interrupt core=VexRiscv hart=0"
+							<< " cycle=" << currentClockCycle()
+							<< " cause=" << (unsigned)VEX_CPU->CsrPlugin_interrupt_code
+							<< " priv=" << (unsigned)VEX_CPU->traceInterruptPrivilege
+							<< endl;
+					}
+					interruptTraceWasHigh = interruptTraceHigh;
+				#endif
 
 				for(SimElement* simElement : simElements) simElement->preCycle();
 
@@ -2036,32 +2235,6 @@ public:
 
 	virtual void dBusAccess(uint32_t addr,bool wr, uint32_t size, uint8_t *dataBytes, bool *error) {
 		uint32_t *data = ((uint32_t*)dataBytes);
-
-#ifdef TRACE_ACCESS
-		if(wr){
-			uint32_t logPc = VEX_CPU->memoryStagePc;
-			uint64_t clkStart = normalizeStartCycle(VEX_CPU->memoryStageStartCycle);
-			uint64_t clkEnd = currentClockCycle();
-			uint64_t value = 0;
-			uint32_t capped = size;
-			if(capped > 8) capped = 8;
-			for(uint32_t b = 0; b < capped; b++){
-				value |= ((uint64_t)((uint8_t*)dataBytes)[b]) << (8*b);
-			}
-			#ifdef TRACE_WITH_TIME
-			memTraces << currentTime;
-			#endif
-			memTraces << " PC " << hex << setw(8) << setfill('0') << logPc;
-			memTraces << " : MEM[0x" << setw(8) << addr << "] <= " << dec << size << " bytes : 0x";
-			uint32_t widthVal = size * 2;
-			if(widthVal < 2) widthVal = 2;
-			memTraces << hex << setw(static_cast<int>(widthVal)) << value;
-			memTraces << dec << setfill(' ')
-			          << " clk_start=" << clkStart
-			          << " clk_end=" << clkEnd
-			          << " clk_span=" << (clkEnd - clkStart + 1) << endl;
-		}
-#endif
 		if(wr){
 			switch(addr){
 			case 0xF0010000u: {

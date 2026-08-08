@@ -509,6 +509,11 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
           redoBranch.payload := input(PC)
 
           when(input(MMU_RSP).refilling){
+            pipeline.replayTraceValid := True
+            pipeline.replayTracePc := input(PC)
+            pipeline.replayTraceInstruction := input(FORMAL_INSTRUCTION)
+            pipeline.replayTraceStartCycle := input(LOG_START_CYCLE)
+            pipeline.replayTraceToken := input(LOG_TOKEN)
             redoBranch.valid := True
             memoryExceptionPort.valid := False
           } elsewhen(input(MMU_FAULT)) {
