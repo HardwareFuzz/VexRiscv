@@ -1194,6 +1194,16 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
 
       val mepcCaptureStage = if(exceptionPortsInfos.nonEmpty) lastStage else decode
 
+      // Architectural privilege associated with normal terminal/interrupt
+      // records. Exception privilege is captured with the faulting instruction
+      // below because the live privilege can change at trap entry.
+      val tracePrivilege = CombInit(privilege).setName("tracePrivilege").addTag(Verilator.public)
+      // The host observes terminal signals after the committing edge. Capture
+      // the pre-edge privilege so XRET cannot make its own record appear to
+      // execute in the privilege mode it has just restored.
+      val traceCommitPrivilege = RegNextWhen(privilege, lastStage.arbitration.isFiring)
+        .init(U"11").setName("traceCommitPrivilege").addTag(Verilator.public)
+
 
       //Aggregate all exception port and remove required instructions
       val exceptionPortCtrl = exceptionPortsInfos.nonEmpty generate new Area{
@@ -1202,6 +1212,15 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
         val exceptionValids = Vec(stages.map(s => Bool().setPartialName(s.getName())))
         val exceptionValidsRegs = Vec(stages.map(s => Reg(Bool).init(False).setPartialName(s.getName()))).allowUnsetRegToAvoidLatch
         val exceptionContext = Reg(ExceptionCause(codeWidth))
+        // Preserve the metadata of the faulting instruction independently of
+        // the normal pipeline, which is removed while the precise exception is
+        // walked to the terminal stage.  Interrupts never write these fields.
+        val exceptionTraceStartCycle = Reg(UInt(64 bits)) init(0) addTag(Verilator.public)
+        val exceptionTraceToken = Reg(UInt(64 bits)) init(0) addTag(Verilator.public)
+        val exceptionTracePc = Reg(UInt(32 bits)) init(0) addTag(Verilator.public)
+        val exceptionTraceInstruction = Reg(Bits(32 bits)) init(0) addTag(Verilator.public)
+        val exceptionTraceIsRvc = Reg(Bool()) init(False) addTag(Verilator.public)
+        val exceptionTracePrivilege = Reg(UInt(2 bits)) init(0) addTag(Verilator.public)
         val exceptionTargetPrivilegeUncapped = U"11"
 
         switch(exceptionContext.code){
@@ -1247,10 +1266,17 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
         exceptionValids := exceptionValidsRegs
         for(portInfo <- sortedByStage; port = portInfo.port ; stage = portInfo.stage; stageId = indexOf(portInfo.stage)) {
           when(port.valid) {
+            if(stage == decode) pipeline.decodeTraceExceptionAlloc := True
             stage.arbitration.flushNext := True
             stage.arbitration.removeIt := True
             exceptionValids(stageId) := True
             exceptionContext := port.payload
+            exceptionTraceStartCycle := stage.input(LOG_START_CYCLE)
+            exceptionTraceToken := stage.input(LOG_TOKEN)
+            exceptionTracePc := stage.input(PC)
+            exceptionTraceInstruction := stage.input(FORMAL_INSTRUCTION)
+            exceptionTraceIsRvc := (if(pipeline.config.withRvc) stage.input(IS_RVC) else False)
+            exceptionTracePrivilege := privilege
           }
         }
 
@@ -1349,10 +1375,15 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
       //Interrupt/Exception entry logic
       val interruptJump = Bool.addTag(Verilator.public)
       interruptJump := interrupt.valid && pipelineLiberator.done && allowInterrupts
+      val traceInterruptPrivilege = RegNextWhen(privilege, interruptJump)
+        .init(U"11").setName("traceInterruptPrivilege").addTag(Verilator.public)
       if(pipelinedInterrupt) interrupt.valid clearWhen(interruptJump) //avoid double fireing
 
       val hadException = RegNext(exception) init(False) addTag(Verilator.public)
       pipelineLiberator.done.clearWhen(hadException)
+      if(exceptionPortCtrl != null) when(hadException) {
+        assert(exceptionPortCtrl.exceptionTraceStartCycle =/= 0)
+      }
 
       if(withPrivilegedDebug) {
         debugBus.commit := debugMode && pipeline.stages.last.arbitration.isFiring

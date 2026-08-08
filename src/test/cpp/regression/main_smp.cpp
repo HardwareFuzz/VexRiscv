@@ -23,6 +23,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,16 @@ static constexpr uint32_t kTohostAddr = 0xF00FFF20u;
 static constexpr uint32_t kDramBase = 0x80000000u;
 // LiteDRAM native ports in this SMP cluster use 128-bit words; cmd_payload_addr is a word index.
 static constexpr uint32_t kDramWordBytes = 16u;
+
+static const char *cx_trace_isa() {
+#ifdef RVD
+    return "rv32fd";
+#elif defined(RVF)
+    return "rv32f";
+#else
+    return "rv32";
+#endif
+}
 
 static bool ends_with(const string &s, const string &suffix) {
     if (suffix.size() > s.size()) return false;
@@ -151,7 +162,10 @@ static void log_mem_write_groups(
     const uint8_t bytes[16],
     uint16_t mask,
     uint64_t clk_start,
-    uint64_t clk_end) {
+    uint64_t clk_end,
+    uint32_t hart_id,
+    uint64_t token,
+    bool token_valid = true) {
     // Group contiguous enabled bytes and emit one line per group.
     int i = 0;
     while (i < 16) {
@@ -173,7 +187,7 @@ static void log_mem_write_groups(
         }
         std::fprintf(
             f,
-            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu\n",
+            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu token_valid=%u event=store_visible store_visible_cycle=%llu start_kind=backend_alloc end_kind=store_visible\n",
             static_cast<unsigned long long>(time),
             static_cast<unsigned int>(pc),
             static_cast<unsigned int>(base + static_cast<uint32_t>(start)),
@@ -181,7 +195,11 @@ static void log_mem_write_groups(
             hex.c_str(),
             static_cast<unsigned long long>(clk_start),
             static_cast<unsigned long long>(clk_end),
-            static_cast<unsigned long long>(clk_end - clk_start + 1));
+            static_cast<unsigned long long>(clk_end - clk_start + 1),
+            static_cast<unsigned int>(hart_id),
+            static_cast<unsigned long long>(token),
+            static_cast<unsigned int>(token_valid ? 1u : 0u),
+            static_cast<unsigned long long>(clk_end));
     }
 }
 
@@ -193,7 +211,10 @@ static void log_mem_write_masked32(
     uint32_t data,
     uint8_t mask,
     uint64_t clk_start,
-    uint64_t clk_end) {
+    uint64_t clk_end,
+    uint32_t hart_id,
+    uint64_t token,
+    bool token_valid = true) {
     uint8_t bytes[4];
     bytes[0] = static_cast<uint8_t>((data >> 0) & 0xFF);
     bytes[1] = static_cast<uint8_t>((data >> 8) & 0xFF);
@@ -219,7 +240,7 @@ static void log_mem_write_masked32(
         }
         std::fprintf(
             f,
-            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu\n",
+            "%llu PC %08x : MEM[0x%08x] <= %d bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu token_valid=%u event=store_visible store_visible_cycle=%llu start_kind=backend_alloc end_kind=store_visible\n",
             static_cast<unsigned long long>(time),
             static_cast<unsigned int>(pc),
             static_cast<unsigned int>(addr + static_cast<uint32_t>(start)),
@@ -227,7 +248,11 @@ static void log_mem_write_masked32(
             hex.c_str(),
             static_cast<unsigned long long>(clk_start),
             static_cast<unsigned long long>(clk_end),
-            static_cast<unsigned long long>(clk_end - clk_start + 1));
+            static_cast<unsigned long long>(clk_end - clk_start + 1),
+            static_cast<unsigned int>(hart_id),
+            static_cast<unsigned long long>(token),
+            static_cast<unsigned int>(token_valid ? 1u : 0u),
+            static_cast<unsigned long long>(clk_end));
     }
 }
 
@@ -256,6 +281,7 @@ struct PendingStore {
     bool suppress_bus_log;
     uint64_t clk_start;
     uint64_t clk_end;
+    uint64_t token;
     uint64_t observed_cycle;
 };
 
@@ -303,22 +329,24 @@ static void log_direct_store_write(
     uint32_t pc,
     uint32_t addr,
     uint32_t size,
-    uint32_t data,
+    uint64_t data,
     uint64_t clk_start,
-    uint64_t clk_end) {
-    if (size == 0u || size > 4u) return;
-    const uint32_t mask = size == 4u ? 0xffffffffu : ((1u << (size * 8u)) - 1u);
-    const uint32_t masked_data = data & mask;
-    char hex[9];
+    uint64_t clk_end,
+    uint32_t hart_id,
+    uint64_t token) {
+    if (size == 0u || size > 8u) return;
+    const uint64_t mask = size == 8u ? UINT64_MAX : ((1ULL << (size * 8u)) - 1ULL);
+    const uint64_t masked_data = data & mask;
+    char hex[17];
     std::snprintf(
         hex,
         sizeof(hex),
-        "%0*x",
+        "%0*llx",
         static_cast<int>(size * 2u),
-        static_cast<unsigned int>(masked_data));
+        static_cast<unsigned long long>(masked_data));
     std::fprintf(
         mem_trace,
-        "%llu PC %08x : MEM[0x%08x] <= %u bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu\n",
+        "%llu PC %08x : MEM[0x%08x] <= %u bytes : 0x%s clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu token_valid=1 event=arch_store start_kind=backend_alloc end_kind=arch_commit\n",
         static_cast<unsigned long long>(cycle),
         static_cast<unsigned int>(pc),
         static_cast<unsigned int>(addr),
@@ -326,7 +354,9 @@ static void log_direct_store_write(
         hex,
         static_cast<unsigned long long>(clk_start),
         static_cast<unsigned long long>(clk_end),
-        static_cast<unsigned long long>(clk_end - clk_start + 1));
+        static_cast<unsigned long long>(clk_end - clk_start + 1),
+        static_cast<unsigned int>(hart_id),
+        static_cast<unsigned long long>(token));
 }
 
 static bool mask_span(uint16_t mask, uint32_t *start, uint32_t *len) {
@@ -372,6 +402,7 @@ static bool emit_pending_store_write(
     std::deque<PendingStore> *pending_stores,
     FILE *mem_trace,
     FILE *log_trace,
+    FILE *cx_trace,
     uint64_t cycle,
     uint32_t base_addr,
     const uint8_t bytes[16],
@@ -504,6 +535,14 @@ static bool emit_pending_store_write(
                     static_cast<unsigned int>(matched.pc),
                     static_cast<unsigned int>(matched.expected_size),
                     static_cast<unsigned int>(submask));
+                std::fprintf(
+                    cx_trace,
+                    "CXTRACE v=2 event=store_visible core=VexRiscv hart=%u token=%llu cycle=%llu addr=0x%08x size=%u\n",
+                    static_cast<unsigned int>(matched.hart_id),
+                    static_cast<unsigned long long>(matched.token),
+                    static_cast<unsigned long long>(cycle),
+                    static_cast<unsigned int>(matched.addr),
+                    static_cast<unsigned int>(matched.expected_size));
                 if (!matched.suppress_bus_log) {
                     log_mem_write_groups(
                         mem_trace,
@@ -513,7 +552,9 @@ static bool emit_pending_store_write(
                         bytes,
                         submask,
                         matched.clk_start,
-                        matched.clk_end);
+                        matched.clk_end,
+                        matched.hart_id,
+                        matched.token);
                 }
             }
             for (auto it = covered_indices.rbegin(); it != covered_indices.rend(); ++it) {
@@ -577,7 +618,10 @@ static bool emit_pending_store_write(
             bytes,
             mask,
             cycle,
-            cycle);
+            cycle,
+            hart_id,
+            0u,
+            false);
         return false;
     }
 
@@ -595,6 +639,14 @@ static bool emit_pending_store_write(
         static_cast<unsigned int>(mask),
         static_cast<unsigned int>(prefer_hart ? 1u : 0u),
         static_cast<unsigned int>(matched.suppress_bus_log ? 1u : 0u));
+    std::fprintf(
+        cx_trace,
+        "CXTRACE v=2 event=store_visible core=VexRiscv hart=%u token=%llu cycle=%llu addr=0x%08x size=%u\n",
+        static_cast<unsigned int>(matched.hart_id),
+        static_cast<unsigned long long>(matched.token),
+        static_cast<unsigned long long>(cycle),
+        static_cast<unsigned int>(matched.addr),
+        static_cast<unsigned int>(matched.expected_size));
     if (!matched.suppress_bus_log) {
         log_mem_write_groups(
             mem_trace,
@@ -604,7 +656,9 @@ static bool emit_pending_store_write(
             bytes,
             mask,
             matched.clk_start,
-            matched.clk_end);
+            matched.clk_end,
+            matched.hart_id,
+            matched.token);
     }
     return true;
 }
@@ -618,7 +672,7 @@ static void toggle_debug_clock(VVexRiscv *top) {
 
 template <typename TCpu>
 static uint64_t current_clock_cycle(TCpu *cpu, uint64_t fallback_cycle) {
-    const uint64_t sim_cycle = static_cast<uint64_t>(cpu->__PVT__simCycle);
+    const uint64_t sim_cycle = static_cast<uint64_t>(cpu->traceCycle);
     return sim_cycle != 0 ? sim_cycle : (fallback_cycle + 1);
 }
 
@@ -677,14 +731,25 @@ int main(int argc, char **argv) {
     struct FpuTraceWrite {
         uint32_t pc;
         uint64_t clk_start;
-        uint64_t clk_end;
+        uint64_t token;
+        uint64_t writeback_cycle;
+        uint32_t hart_id;
         uint32_t reg;
         bool is_double;
         uint64_t data;
     };
-    std::deque<FpuTraceCommit> fpu_trace_commits;
-    std::deque<FpuTraceWrite> fpu_trace_writes;
+    std::deque<FpuTraceCommit> fpu_trace_commits[2];
+    std::deque<FpuTraceWrite> fpu_trace_writes[2];
 #endif
+
+    struct TerminalTrace {
+        uint64_t clk_start;
+        uint64_t clk_end;
+    };
+    std::unordered_map<uint64_t, TerminalTrace> terminal_trace_by_token[2];
+    uint64_t term_seq[2] = {0u, 0u};
+    uint64_t instret_seq[2] = {0u, 0u};
+    bool interrupt_trace_was_high[2] = {false, false};
 
     VVexRiscv *top = new VVexRiscv;
 
@@ -693,6 +758,24 @@ int main(int argc, char **argv) {
         std::perror("failed to open run.logTrace");
         return 2;
     }
+    FILE *cx_trace = std::fopen("run.cxTrace", "w");
+    if (!cx_trace) {
+        std::perror("failed to open run.cxTrace");
+        return 2;
+    }
+    std::fprintf(
+        cx_trace,
+        "trace_version=2\n"
+        "cycle_domain=core_ref_clk\n"
+        "cycle_base=first_post_reset_posedge_is_1\n"
+        "interval=inclusive\n"
+        "start_kind=backend_alloc\n"
+        "end_kind=arch_commit_or_precise_trap\n"
+        "core=VexRiscv\n"
+        "harts=2\n"
+        "isa=%s\n"
+        "build_config=regression_2c\n",
+        cx_trace_isa());
 
     // Static input tie-offs.
     top->interrupts = 0;
@@ -771,9 +854,6 @@ int main(int argc, char **argv) {
     uint64_t rdata_d_count = 0;
 
     // Per-core store edge tracking (memory stage can be held while back-pressured).
-    uint8_t cpu0_store_prev = 0;
-    uint8_t cpu1_store_prev = 0;
-    std::deque<PendingStore> pending_stores;
 
     // Extra visibility: capture if data/periph ever toggles.
     uint64_t d_cmd_seen = 0;
@@ -862,68 +942,139 @@ int main(int argc, char **argv) {
         auto *cpu0 = soc->cores_0_cpu_logic_cpu;
         auto *cpu1 = soc->cores_1_cpu_logic_cpu;
 
+        // Both cores are clocked and reset by the same cluster domain. A
+        // divergence would make cross-hart cycle comparisons meaningless.
+        if (cpu0->traceCycle != cpu1->traceCycle) {
+            std::fprintf(
+                log_trace,
+                "ERROR trace_cycle_domain_mismatch hart0=%llu hart1=%llu host_cycle=%llu\n",
+                static_cast<unsigned long long>(cpu0->traceCycle),
+                static_cast<unsigned long long>(cpu1->traceCycle),
+                static_cast<unsigned long long>(cycle));
+            std::cerr << "VexRiscv hart trace cycles diverged" << std::endl;
+            exit_code = 3;
+            done = true;
+            break;
+        }
+
         // Register writes and timing-only commit lines.
-        auto log_commit = [&](auto *cpu) {
+        auto log_commit = [&](auto *cpu, uint32_t hart_id) {
             if (!cpu->lastStageIsFiring) return;
 
             const uint64_t clk_end = current_clock_cycle(cpu, cycle);
-            const uint64_t clk_start =
-                normalize_start_cycle(static_cast<uint64_t>(cpu->lastStageStartCycle), clk_end);
+            const uint64_t clk_start = static_cast<uint64_t>(cpu->lastStageStartCycle);
+            const uint64_t token = static_cast<uint64_t>(cpu->lastStageToken);
+            const uint32_t insn_len = cpu->lastStageIsRvc ? 2u : 4u;
+            const uint32_t insn = static_cast<uint32_t>(cpu->lastStageRawInstruction) &
+                (insn_len == 2u ? 0xffffu : 0xffffffffu);
+            const uint32_t priv = static_cast<uint32_t>(cpu->traceCommitPrivilege);
+#if defined(RVF) || defined(RVD)
+            if (cpu->writeBack_FpuPlugin_commit_valid &&
+                cpu->writeBack_FpuPlugin_commit_ready &&
+                cpu->writeBack_FpuPlugin_commit_payload_write) {
+                terminal_trace_by_token[hart_id][token] = TerminalTrace{clk_start, clk_end};
+            }
+#endif
+            std::fprintf(
+                cx_trace,
+                "CXTRACE v=2 event=inst_terminal core=VexRiscv hart=%u token=%llu term_seq=%llu instret_seq=%llu commit_slot=0 pc=0x%08x insn=0x%08x insn_len=%u start_cycle=%llu end_cycle=%llu span=%llu start_kind=backend_alloc end_kind=arch_commit retired=1 trap=0 cause=none priv=%u\n",
+                static_cast<unsigned int>(hart_id),
+                static_cast<unsigned long long>(token),
+                static_cast<unsigned long long>(term_seq[hart_id]),
+                static_cast<unsigned long long>(instret_seq[hart_id]),
+                static_cast<unsigned int>(cpu->lastStagePc),
+                static_cast<unsigned int>(insn),
+                static_cast<unsigned int>(insn_len),
+                static_cast<unsigned long long>(clk_start),
+                static_cast<unsigned long long>(clk_end),
+                static_cast<unsigned long long>(clk_end - clk_start + 1u),
+                static_cast<unsigned int>(priv));
+
+            if (cpu->traceStoreCommit) {
+                log_direct_store_write(
+                    mem_trace,
+                    clk_end,
+                    static_cast<uint32_t>(cpu->lastStagePc),
+                    static_cast<uint32_t>(cpu->traceStoreAddress),
+                    1u << static_cast<uint32_t>(cpu->traceStoreSize),
+                    static_cast<uint64_t>(cpu->traceStoreData),
+                    clk_start,
+                    clk_end,
+                    hart_id,
+                    token);
+            }
+            term_seq[hart_id]++;
+            instret_seq[hart_id]++;
 
             if (cpu->lastStageRegFileWrite_valid &&
                 cpu->lastStageRegFileWrite_payload_address != 0) {
                 std::fprintf(
                     reg_trace,
-                    "%llu PC %08x : reg[%2u] = %08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                    "%llu PC %08x : reg[%2u] = %08x clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu commit_slot=0 retired=1 trap=0 event=inst_terminal start_kind=backend_alloc end_kind=arch_commit\n",
                     static_cast<unsigned long long>(cycle),
                     static_cast<unsigned int>(cpu->lastStagePc),
                     static_cast<unsigned int>(cpu->lastStageRegFileWrite_payload_address),
                     static_cast<unsigned int>(cpu->lastStageRegFileWrite_payload_data),
                     static_cast<unsigned long long>(clk_start),
                     static_cast<unsigned long long>(clk_end),
-                    static_cast<unsigned long long>(clk_end - clk_start + 1));
+                    static_cast<unsigned long long>(clk_end - clk_start + 1),
+                    static_cast<unsigned int>(hart_id),
+                    static_cast<unsigned long long>(token));
             } else {
                 std::fprintf(
                     reg_trace,
-                    "%llu PC %08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                    "%llu PC %08x clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu commit_slot=0 retired=1 trap=0 event=inst_terminal start_kind=backend_alloc end_kind=arch_commit\n",
                     static_cast<unsigned long long>(cycle),
                     static_cast<unsigned int>(cpu->lastStagePc),
                     static_cast<unsigned long long>(clk_start),
                     static_cast<unsigned long long>(clk_end),
-                    static_cast<unsigned long long>(clk_end - clk_start + 1));
+                    static_cast<unsigned long long>(clk_end - clk_start + 1),
+                    static_cast<unsigned int>(hart_id),
+                    static_cast<unsigned long long>(token));
             }
         };
-        log_commit(cpu0);
-        log_commit(cpu1);
+        log_commit(cpu0, 0u);
+        log_commit(cpu1, 1u);
 
 #if defined(RVF) || defined(RVD)
-        if (cpu0->writeBack_FpuPlugin_commit_valid &&
-            cpu0->writeBack_FpuPlugin_commit_ready &&
-            cpu0->writeBack_FpuPlugin_commit_payload_write) {
-            fpu_trace_commits.push_back(FpuTraceCommit{
-                static_cast<uint32_t>(cpu0->writeBack_FpuPlugin_commit_payload_opcode),
-                static_cast<uint64_t>(cpu0->writeBack_FpuPlugin_commit_payload_value),
-            });
-        }
+        auto capture_fpu_commit = [&](auto *cpu, uint32_t hart_id) {
+            if (cpu->writeBack_FpuPlugin_commit_valid &&
+                cpu->writeBack_FpuPlugin_commit_ready &&
+                cpu->writeBack_FpuPlugin_commit_payload_write) {
+                fpu_trace_commits[hart_id].push_back(FpuTraceCommit{
+                    static_cast<uint32_t>(cpu->writeBack_FpuPlugin_commit_payload_opcode),
+                    static_cast<uint64_t>(cpu->writeBack_FpuPlugin_commit_payload_value),
+                });
+            }
+        };
+        capture_fpu_commit(cpu0, 0u);
+        capture_fpu_commit(cpu1, 1u);
         if (soc->fpu_0_logic && soc->fpu_0_logic->fregWriteValid) {
             const uint64_t cpu0_clk = current_clock_cycle(cpu0, cycle);
             const uint64_t cpu1_clk = current_clock_cycle(cpu1, cycle);
             const uint64_t fclk_end = cpu0_clk > cpu1_clk ? cpu0_clk : cpu1_clk;
+            const uint32_t hart_id = static_cast<uint32_t>(soc->fpu_0_logic->fregWriteHart) & 1u;
             FpuTraceWrite trace_write = {
                 static_cast<uint32_t>(soc->fpu_0_logic->fregWritePc),
                 normalize_start_cycle(
                     static_cast<uint64_t>(soc->fpu_0_logic->fregWriteStartCycle),
                     fclk_end),
+                static_cast<uint64_t>(soc->fpu_0_logic->fregWriteToken),
                 fclk_end,
+                hart_id,
                 static_cast<uint32_t>(soc->fpu_0_logic->fregWriteReg),
                 static_cast<bool>(soc->fpu_0_logic->fregWriteIsDouble),
                 static_cast<uint64_t>(soc->fpu_0_logic->fregWriteData),
             };
-            fpu_trace_writes.push_back(trace_write);
+            fpu_trace_writes[hart_id].push_back(trace_write);
         }
-        while (!fpu_trace_commits.empty() && !fpu_trace_writes.empty()) {
-            const FpuTraceCommit trace_commit = fpu_trace_commits.front();
-            const FpuTraceWrite trace_write = fpu_trace_writes.front();
+        for (uint32_t hart_id = 0u; hart_id < 2u; ++hart_id) {
+          while (!fpu_trace_commits[hart_id].empty() && !fpu_trace_writes[hart_id].empty()) {
+            const FpuTraceWrite trace_write = fpu_trace_writes[hart_id].front();
+            auto terminal_it = terminal_trace_by_token[hart_id].find(trace_write.token);
+            if (terminal_it == terminal_trace_by_token[hart_id].end()) break;
+            const TerminalTrace terminal_trace = terminal_it->second;
+            const FpuTraceCommit trace_commit = fpu_trace_commits[hart_id].front();
             const bool use_commit_value =
                 trace_commit.opcode == kFpuOpcodeLoad ||
                 trace_commit.opcode == kFpuOpcodeFmvWX;
@@ -935,113 +1086,132 @@ int main(int argc, char **argv) {
                 : trace_write.data;
             std::fprintf(
                 freg_trace,
-                "PC %08x : f[%2u] = 0x%016llx clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                "PC %08x : f[%2u] = 0x%016llx clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu event=writeback writeback_cycle=%llu start_kind=backend_alloc end_kind=arch_commit\n",
                 static_cast<unsigned int>(trace_write.pc),
                 static_cast<unsigned int>(trace_write.reg),
                 static_cast<unsigned long long>(fval),
-                static_cast<unsigned long long>(trace_write.clk_start),
-                static_cast<unsigned long long>(trace_write.clk_end),
-                static_cast<unsigned long long>(trace_write.clk_end - trace_write.clk_start + 1));
+                static_cast<unsigned long long>(terminal_trace.clk_start),
+                static_cast<unsigned long long>(terminal_trace.clk_end),
+                static_cast<unsigned long long>(terminal_trace.clk_end - terminal_trace.clk_start + 1),
+                static_cast<unsigned int>(hart_id),
+                static_cast<unsigned long long>(trace_write.token),
+                static_cast<unsigned long long>(trace_write.writeback_cycle));
 #else
             const uint32_t fval = use_commit_value
                 ? static_cast<uint32_t>(trace_commit.value)
                 : static_cast<uint32_t>(trace_write.data);
             std::fprintf(
                 freg_trace,
-                "PC %08x : f[%2u] = 0x%08x clk_start=%llu clk_end=%llu clk_span=%llu\n",
+                "PC %08x : f[%2u] = 0x%08x clk_start=%llu clk_end=%llu clk_span=%llu hart=%u token=%llu event=writeback writeback_cycle=%llu start_kind=backend_alloc end_kind=arch_commit\n",
                 static_cast<unsigned int>(trace_write.pc),
                 static_cast<unsigned int>(trace_write.reg),
                 static_cast<unsigned int>(fval),
-                static_cast<unsigned long long>(trace_write.clk_start),
-                static_cast<unsigned long long>(trace_write.clk_end),
-                static_cast<unsigned long long>(trace_write.clk_end - trace_write.clk_start + 1));
+                static_cast<unsigned long long>(terminal_trace.clk_start),
+                static_cast<unsigned long long>(terminal_trace.clk_end),
+                static_cast<unsigned long long>(terminal_trace.clk_end - terminal_trace.clk_start + 1),
+                static_cast<unsigned int>(hart_id),
+                static_cast<unsigned long long>(trace_write.token),
+                static_cast<unsigned long long>(trace_write.writeback_cycle));
 #endif
-            fpu_trace_commits.pop_front();
-            fpu_trace_writes.pop_front();
+            std::fprintf(
+                cx_trace,
+                "CXTRACE v=2 event=writeback core=VexRiscv hart=%u token=%llu cycle=%llu rd_kind=f rd=%u\n",
+                static_cast<unsigned int>(hart_id),
+                static_cast<unsigned long long>(trace_write.token),
+                static_cast<unsigned long long>(trace_write.writeback_cycle),
+                static_cast<unsigned int>(trace_write.reg));
+            fpu_trace_commits[hart_id].pop_front();
+            fpu_trace_writes[hart_id].pop_front();
+            terminal_trace_by_token[hart_id].erase(terminal_it);
+          }
         }
 #endif
 
         // Exceptions
         if (cpu0->CsrPlugin_hadException) {
             const uint64_t clk_end = current_clock_cycle(cpu0, cycle);
-            const uint64_t clk_start =
-                normalize_start_cycle(static_cast<uint64_t>(cpu0->lastStageStartCycle), clk_end);
+            const uint64_t clk_start = static_cast<uint64_t>(cpu0->CsrPlugin_exceptionPortCtrl_exceptionTraceStartCycle);
+            const uint64_t token = static_cast<uint64_t>(cpu0->CsrPlugin_exceptionPortCtrl_exceptionTraceToken);
+            const uint32_t pc = static_cast<uint32_t>(cpu0->CsrPlugin_exceptionPortCtrl_exceptionTracePc);
+            const uint32_t insn_len = cpu0->CsrPlugin_exceptionPortCtrl_exceptionTraceIsRvc ? 2u : 4u;
+            const uint32_t insn = static_cast<uint32_t>(cpu0->CsrPlugin_exceptionPortCtrl_exceptionTraceInstruction) &
+                (insn_len == 2u ? 0xffffu : 0xffffffffu);
+            const uint32_t cause = static_cast<uint32_t>(cpu0->CsrPlugin_trapCause);
+            const uint32_t priv = static_cast<uint32_t>(cpu0->CsrPlugin_exceptionPortCtrl_exceptionTracePrivilege);
             std::fprintf(
                 log_trace,
-                "EXC pc=0x%08x cause=%u clk_start=%llu clk_end=%llu clk_span=%llu\n",
-                static_cast<unsigned int>(cpu0->lastStagePc),
-                static_cast<unsigned int>(cpu0->CsrPlugin_trapCause),
+                "EXC pc=0x%08x cause=%u clk_start=%llu clk_end=%llu clk_span=%llu hart=0 token=%llu commit_slot=0 retired=0 trap=1 event=inst_terminal start_kind=backend_alloc end_kind=precise_trap\n",
+                static_cast<unsigned int>(pc),
+                static_cast<unsigned int>(cause),
                 static_cast<unsigned long long>(clk_start),
                 static_cast<unsigned long long>(clk_end),
-                static_cast<unsigned long long>(clk_end - clk_start + 1));
+                static_cast<unsigned long long>(clk_end - clk_start + 1),
+                static_cast<unsigned long long>(token));
+            std::fprintf(
+                cx_trace,
+                "CXTRACE v=2 event=inst_terminal core=VexRiscv hart=0 token=%llu term_seq=%llu instret_seq=- commit_slot=0 pc=0x%08x insn=0x%08x insn_len=%u start_cycle=%llu end_cycle=%llu span=%llu start_kind=backend_alloc end_kind=precise_trap retired=0 trap=1 cause=%u priv=%u\n",
+                static_cast<unsigned long long>(token),
+                static_cast<unsigned long long>(term_seq[0]),
+                static_cast<unsigned int>(pc),
+                static_cast<unsigned int>(insn),
+                static_cast<unsigned int>(insn_len),
+                static_cast<unsigned long long>(clk_start),
+                static_cast<unsigned long long>(clk_end),
+                static_cast<unsigned long long>(clk_end - clk_start + 1u),
+                static_cast<unsigned int>(cause),
+                static_cast<unsigned int>(priv));
+            term_seq[0]++;
         }
         if (cpu1->CsrPlugin_hadException) {
             const uint64_t clk_end = current_clock_cycle(cpu1, cycle);
-            const uint64_t clk_start =
-                normalize_start_cycle(static_cast<uint64_t>(cpu1->lastStageStartCycle), clk_end);
+            const uint64_t clk_start = static_cast<uint64_t>(cpu1->CsrPlugin_exceptionPortCtrl_exceptionTraceStartCycle);
+            const uint64_t token = static_cast<uint64_t>(cpu1->CsrPlugin_exceptionPortCtrl_exceptionTraceToken);
+            const uint32_t pc = static_cast<uint32_t>(cpu1->CsrPlugin_exceptionPortCtrl_exceptionTracePc);
+            const uint32_t insn_len = cpu1->CsrPlugin_exceptionPortCtrl_exceptionTraceIsRvc ? 2u : 4u;
+            const uint32_t insn = static_cast<uint32_t>(cpu1->CsrPlugin_exceptionPortCtrl_exceptionTraceInstruction) &
+                (insn_len == 2u ? 0xffffu : 0xffffffffu);
+            const uint32_t cause = static_cast<uint32_t>(cpu1->CsrPlugin_trapCause);
+            const uint32_t priv = static_cast<uint32_t>(cpu1->CsrPlugin_exceptionPortCtrl_exceptionTracePrivilege);
             std::fprintf(
                 log_trace,
-                "EXC pc=0x%08x cause=%u clk_start=%llu clk_end=%llu clk_span=%llu\n",
-                static_cast<unsigned int>(cpu1->lastStagePc),
-                static_cast<unsigned int>(cpu1->CsrPlugin_trapCause),
+                "EXC pc=0x%08x cause=%u clk_start=%llu clk_end=%llu clk_span=%llu hart=1 token=%llu commit_slot=0 retired=0 trap=1 event=inst_terminal start_kind=backend_alloc end_kind=precise_trap\n",
+                static_cast<unsigned int>(pc),
+                static_cast<unsigned int>(cause),
                 static_cast<unsigned long long>(clk_start),
                 static_cast<unsigned long long>(clk_end),
-                static_cast<unsigned long long>(clk_end - clk_start + 1));
+                static_cast<unsigned long long>(clk_end - clk_start + 1),
+                static_cast<unsigned long long>(token));
+            std::fprintf(
+                cx_trace,
+                "CXTRACE v=2 event=inst_terminal core=VexRiscv hart=1 token=%llu term_seq=%llu instret_seq=- commit_slot=0 pc=0x%08x insn=0x%08x insn_len=%u start_cycle=%llu end_cycle=%llu span=%llu start_kind=backend_alloc end_kind=precise_trap retired=0 trap=1 cause=%u priv=%u\n",
+                static_cast<unsigned long long>(token),
+                static_cast<unsigned long long>(term_seq[1]),
+                static_cast<unsigned int>(pc),
+                static_cast<unsigned int>(insn),
+                static_cast<unsigned int>(insn_len),
+                static_cast<unsigned long long>(clk_start),
+                static_cast<unsigned long long>(clk_end),
+                static_cast<unsigned long long>(clk_end - clk_start + 1u),
+                static_cast<unsigned int>(cause),
+                static_cast<unsigned int>(priv));
+            term_seq[1]++;
         }
 
-        // Memory writes (architectural stores) from the memory stage pipeline regs.
-        // This avoids relying on internal dBus wiring which can be hidden behind cache/arb wrappers.
-        auto log_store = [&](auto *cpu, uint32_t hart_id, uint8_t &prev) {
-            const uint8_t is_store = (cpu->__PVT__memory_arbitration_isValid && cpu->__PVT__execute_to_memory_MEMORY_ENABLE && cpu->__PVT__execute_to_memory_MEMORY_WR) ? 1 : 0;
-            if (is_store && !prev) {
-                const uint32_t pc = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_PC);
-                const uint32_t insn = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_INSTRUCTION);
-                const uint32_t addr = static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_VIRTUAL_ADDRESS);
-                const uint64_t clk_end = current_clock_cycle(cpu, cycle);
-                const uint64_t clk_start = normalize_start_cycle(
-                    static_cast<uint64_t>(cpu->memoryStageStartCycle),
-                    clk_end);
-                const uint32_t expected_size = decode_store_size(insn);
-
-                if (expected_size != 0u) {
-                    const bool direct_integer_store = is_direct_integer_store(insn);
-                    if (direct_integer_store) {
-                        log_direct_store_write(
-                            mem_trace,
-                            cycle,
-                            pc,
-                            addr,
-                            expected_size,
-                            static_cast<uint32_t>(cpu->__PVT__execute_to_memory_MEMORY_STORE_DATA_RF),
-                            clk_start,
-                            clk_end);
-                    }
-                    pending_stores.push_back(PendingStore{
-                        hart_id,
-                        pc,
-                        insn,
-                        addr,
-                        expected_size,
-                        direct_integer_store,
-                        clk_start,
-                        clk_end,
-                        cycle,
-                    });
-                } else {
-                    std::fprintf(
-                        log_trace,
-                        "WARN unknown_store hart=%u pc=0x%08x insn=0x%08x addr=0x%08x cycle=%llu\n",
-                        static_cast<unsigned int>(hart_id),
-                        static_cast<unsigned int>(pc),
-                        static_cast<unsigned int>(insn),
-                        static_cast<unsigned int>(addr),
-                        static_cast<unsigned long long>(cycle));
-                }
+        auto log_interrupt = [&](auto *cpu, uint32_t hart_id) {
+            const bool high = static_cast<bool>(cpu->CsrPlugin_interruptJump);
+            if (high && !interrupt_trace_was_high[hart_id]) {
+                std::fprintf(
+                    cx_trace,
+                    "CXTRACE v=2 event=interrupt core=VexRiscv hart=%u cycle=%llu cause=%u priv=%u\n",
+                    static_cast<unsigned int>(hart_id),
+                    static_cast<unsigned long long>(current_clock_cycle(cpu, cycle)),
+                    static_cast<unsigned int>(cpu->CsrPlugin_interrupt_code),
+                    static_cast<unsigned int>(cpu->traceInterruptPrivilege));
             }
-            prev = is_store;
+            interrupt_trace_was_high[hart_id] = high;
         };
-        log_store(cpu0, 0u, cpu0_store_prev);
-        log_store(cpu1, 1u, cpu1_store_prev);
+        log_interrupt(cpu0, 0u);
+        log_interrupt(cpu1, 1u);
 
         // Consume read data if the DUT is ready.
         if (top->iBridge_dram_rdata_valid) {
@@ -1098,16 +1268,6 @@ int main(int argc, char **argv) {
                 bytes[1] = static_cast<uint8_t>((wdata >> 8) & 0xFFu);
                 bytes[2] = static_cast<uint8_t>((wdata >> 16) & 0xFFu);
                 bytes[3] = static_cast<uint8_t>((wdata >> 24) & 0xFFu);
-                emit_pending_store_write(
-                    &pending_stores,
-                    mem_trace,
-                    log_trace,
-                    cycle,
-                    addr,
-                    bytes,
-                    static_cast<uint16_t>(sel),
-                    false,
-                    0u);
                 uint32_t merged = tohost_reg;
                 for (int b = 0; b < 4; b++) {
                     if ((sel >> b) & 1u) {
@@ -1241,16 +1401,6 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < 16; i++) {
                     if ((mask >> i) & 1u) mem[addr + static_cast<uint32_t>(i)] = bytes[i];
                 }
-                emit_pending_store_write(
-                    &pending_stores,
-                    mem_trace,
-                    log_trace,
-                    cycle,
-                    addr,
-                    bytes,
-                    mask,
-                    true,
-                    write_cmd.source);
             }
         }
 
@@ -1273,20 +1423,6 @@ int main(int argc, char **argv) {
         static_cast<unsigned long long>(periph_count),
         static_cast<unsigned long long>(wdata_i_count),
         static_cast<unsigned long long>(wdata_d_count));
-    while (!pending_stores.empty()) {
-        const PendingStore &stale = pending_stores.front();
-        std::fprintf(
-            log_trace,
-            "WARN pending_store_leftover hart=%u pc=0x%08x addr=0x%08x size=%u observed=%llu done_cycle=%llu\n",
-            static_cast<unsigned int>(stale.hart_id),
-            static_cast<unsigned int>(stale.pc),
-            static_cast<unsigned int>(stale.addr),
-            static_cast<unsigned int>(stale.expected_size),
-            static_cast<unsigned long long>(stale.observed_cycle),
-            static_cast<unsigned long long>(cycle));
-        pending_stores.pop_front();
-    }
-
     std::fflush(mem_trace);
     std::fclose(mem_trace);
 
@@ -1300,6 +1436,9 @@ int main(int argc, char **argv) {
 
     std::fflush(log_trace);
     std::fclose(log_trace);
+
+    std::fflush(cx_trace);
+    std::fclose(cx_trace);
 
     delete top;
     return exit_code;

@@ -183,6 +183,9 @@ case class DataCacheCpuWriteBack(p : DataCacheConfig) extends Bundle with IMaste
   val haltIt = Bool()
   val isWrite = Bool()
   val storeData = Bits(p.cpuDataWidth bit)
+  // Final bytes selected for an accepted store. For AMOs this is the
+  // read-modify-write result rather than the source register operand.
+  val committedStoreData = Bits(p.cpuDataWidth bit)
   val data = Bits(p.cpuDataWidth bit)
   val address = UInt(p.addressWidth bit)
   val mmuException, unalignedAccess, accessError = Bool()
@@ -192,7 +195,7 @@ case class DataCacheCpuWriteBack(p : DataCacheConfig) extends Bundle with IMaste
 
   override def asMaster(): Unit = {
     out(isValid,isStuck,isUser, address, fence, storeData, isFiring)
-    in(haltIt, data, mmuException, unalignedAccess, accessError, isWrite, keepMemRspData, exclusiveOk)
+    in(haltIt, data, committedStoreData, mmuException, unalignedAccess, accessError, isWrite, keepMemRspData, exclusiveOk)
   }
 }
 
@@ -894,6 +897,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     val isExternalAmo  = if(withExternalAmo)  request.isAmo  else False
 
     val requestDataBypass = CombInit(io.cpu.writeBack.storeData)
+    io.cpu.writeBack.committedStoreData := requestDataBypass
     import DataCacheExternalAmoStates._
     val amo = withAmo generate new Area{
       def rf = io.cpu.writeBack.storeData(p.rfDataWidth-1 downto 0)
