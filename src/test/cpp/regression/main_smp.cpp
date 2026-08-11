@@ -1053,7 +1053,15 @@ int main(int argc, char **argv) {
             const uint64_t cpu0_clk = current_clock_cycle(cpu0, cycle);
             const uint64_t cpu1_clk = current_clock_cycle(cpu1, cycle);
             const uint64_t fclk_end = cpu0_clk > cpu1_clk ? cpu0_clk : cpu1_clk;
-            const uint32_t hart_id = static_cast<uint32_t>(soc->fpu_0_logic->fregWriteHart) & 1u;
+            // fregWriteHart is the FpuCore *port* index, not the hart id.
+            // VexRiscvSmpLitexCluster connects group(i) <-> port(i) where
+            // group = cores.reverse.grouped(cpuPerFpu), so for this 2-core
+            // layout port0 -> hart1 and port1 -> hart0. Using the raw port
+            // index as hart_id routed every FP writeback into the wrong
+            // hart's queue, so the token lookup against
+            // terminal_trace_by_token always missed and the pairing loop
+            // broke immediately -- run.fregTrace stayed empty.
+            const uint32_t hart_id = 1u - (static_cast<uint32_t>(soc->fpu_0_logic->fregWriteHart) & 1u);
             FpuTraceWrite trace_write = {
                 static_cast<uint32_t>(soc->fpu_0_logic->fregWritePc),
                 normalize_start_cycle(
