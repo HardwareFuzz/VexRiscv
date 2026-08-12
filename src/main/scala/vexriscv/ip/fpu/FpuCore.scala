@@ -845,6 +845,9 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val sgnjRs1Sign = CombInit(input.rs1.sign)
     val sgnjRs2Sign = CombInit(input.rs2.sign)
     if(p.withDouble){
+      // A NaN-boxed single read by a double-precision SGNJ has bit 63 set
+      // (the 0xFFFFFFFF upper word), so its sign as a double operand is 1.
+      sgnjRs1Sign setWhen(input.rs1Boxed && input.format === FpuFormat.DOUBLE)
       sgnjRs2Sign setWhen(input.rs2Boxed && input.format === FpuFormat.DOUBLE)
     }
     val sgnjResult = (sgnjRs1Sign && input.arg(1)) ^ sgnjRs2Sign ^ input.arg(0)
@@ -898,12 +901,43 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
         }
       }
       is(FpuOpcode.SGNJ){
-        when(!input.rs1.isNan) {
-          rfOutput.value.sign := sgnjResult
-        }
+        // fsgnj/fsgnjn/fsgnjx are pure bit-level sign manipulations per the
+        // RISC-V spec: no NaN detection, no NaN-box unboxing. The sign bit is
+        // always replaced by sgnjResult, even for NaN rs1.
+        rfOutput.value.sign := sgnjResult
         if(p.withDouble) when(input.rs1Boxed && input.format === FpuFormat.DOUBLE){
-          rfOutput.value.sign := input.rs1.sign
-          rfOutput.format := FpuFormat.FLOAT
+          // fsgnj.d on a NaN-boxed single rs1: the 64-bit operand is the NaN-box
+          // pattern 0xFFFFFFFF ## float32(rs1), and the result keeps rs1[62:0] =
+          // 0x7FFFFFFF ## float32(rs1) with only the sign bit replaced. Encode
+          // that as a double NaN (exp=0x7FF, mantissa=0xFFFFF ## float32(rs1))
+          // so the double writeback reproduces the exact 64-bit pattern.
+          // f32.exp recovers the raw f32 exponent for normal/zero boxed floats
+          // (recoded = raw + 1920), but the load recode rewrites the exponent
+          // for NaN/Inf boxed floats — both have IEEE exp8 = 0xFF — so restore
+          // it here. The 52-bit concatenation C = 0xFFFFF ## sign ## exp ## man
+          // is placed at mantissa bits 52..1 via @@U"0" (bit 52 is the leading
+          // bit of the 53-bit writeFloating; roundBack reads mantissa[52:1]),
+          // so the double writeback yields exactly
+          //   sign ## 0x7FF ## C = {newSign} 0xFFFFFFFF ## float32(rs1).
+          val f32ExpCorrected = CombInit(f32.exp)
+          val f32ManCorrected = CombInit(f32.man)
+          when(input.rs1.isNan || input.rs1.isInfinity){ f32ExpCorrected := 0xFF }
+          // Boxed f32 SUBNORMAL (raw IEEE exp8 = 0, man23 != 0): the load recode
+          // normalizes it by left-shifting the mantissa and setting the recoded
+          // exponent to exponentOne-149+msbPos (range [1898, 1920]), so the raw
+          // f32 fields are no longer directly present in f32.exp/f32.man. Recover
+          // the raw 23-bit mantissa from the shifted 52-bit field with the same
+          // mod-64 denormalization the STORE/FMV FSM uses (formatShiftOffset =
+          // exponentOne-(127+34) = 1886, minus the recoded exponent wrapped into
+          // the 6-bit shift counter): man23 = ((1 ## mantissa) >> (1950 - exp))[22:0].
+          // The implicit leading 1 supplies bit msbPos, the shifted field the rest.
+          when(!input.rs1.special && input.rs1.exponent <= U(exponentOne-127) && input.rs1.exponent >= U(exponentOne-149)){
+            f32ExpCorrected := 0
+            f32ManCorrected := (((U(1, 1 bits) @@ input.rs1.mantissa) >> (U(exponentOne-97) - input.rs1.exponent))(22 downto 0)).resized
+          }
+          rfOutput.value.setNan
+          rfOutput.value.exponent(11 downto 3) := 0
+          rfOutput.value.mantissa := (U(0xFFFFF, 20 bits) ## input.rs1.sign ## f32ExpCorrected ## f32ManCorrected).asUInt @@ U"0"
         }
       }
       if(p.withDouble) is(FpuOpcode.FCVT_X_X){
