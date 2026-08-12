@@ -897,6 +897,7 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
           rfOutput.value.special := input.rs2.special
         }
         when(minMaxSelectNanQuiet){
+          rfOutput.value.sign := False  // both-NaN fmin/fmax -> canonical NaN (positive sign)
           rfOutput.value.setNanQuiet
         }
       }
@@ -1068,6 +1069,7 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       when(exp(exp.getWidth-3, 3 bits) >= 5) { output.exponent(p.internalExponentSize-2, 2 bits) := 3 }
 
       when(forceNan) {
+        output.sign := False  // canonical NaN requires positive sign (spec norm:F_canonical_NaN)
         output.setNanQuiet
         NV setWhen(infinitynan || input.rs1.isNanSignaling || input.rs2.isNanSignaling)
       } elsewhen(forceOverflow) {
@@ -1180,6 +1182,7 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     when(exponent(exponent.getWidth-3, 3 bits) === 7) { output.value.exponent(p.internalExponentSize-2, 2 bits) := 3 }
 
     when(forceNan) {
+      output.value.sign := False  // canonical NaN requires positive sign (spec norm:F_canonical_NaN)
       output.value.setNanQuiet
       output.NV setWhen((infinitynan || input.rs1.isNanSignaling || input.rs2.isNanSignaling))
     } elsewhen(forceOverflow) {
@@ -1229,10 +1232,12 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       output.value.setInfinity
     }
     when(negative){
+      output.value.sign := False  // canonical NaN requires positive sign (spec norm:F_canonical_NaN)
       output.value.setNanQuiet
       output.NV := True
     }
     when(input.rs1.isNan){
+      output.value.sign := False  // canonical NaN requires positive sign (spec norm:F_canonical_NaN)
       output.value.setNanQuiet
       output.NV := !input.rs1.isQuiet
     }
@@ -1602,6 +1607,7 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       output.NV := infinityNan || input.rs1.isNanSignaling || input.rs2.isNanSignaling
       output.DZ := False
       when(forceNan) {
+        output.value.sign := False  // canonical NaN requires positive sign (spec norm:F_canonical_NaN)
         output.value.setNanQuiet
       } elsewhen (forceInfinity) {
         output.value.setInfinity
