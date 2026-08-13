@@ -1123,11 +1123,12 @@ int main(int argc, char **argv) {
 #endif
             std::fprintf(
                 cx_trace,
-                "CXTRACE v=2 event=writeback core=VexRiscv hart=%u token=%llu cycle=%llu rd_kind=f rd=%u\n",
+                "CXTRACE v=2 event=writeback core=VexRiscv hart=%u token=%llu cycle=%llu rd_kind=f rd=%u value=0x%016llx\n",
                 static_cast<unsigned int>(hart_id),
                 static_cast<unsigned long long>(trace_write.token),
                 static_cast<unsigned long long>(trace_write.writeback_cycle),
-                static_cast<unsigned int>(trace_write.reg));
+                static_cast<unsigned int>(trace_write.reg),
+                static_cast<unsigned long long>(fval));
             fpu_trace_commits[hart_id].pop_front();
             fpu_trace_writes[hart_id].pop_front();
             terminal_trace_by_token[hart_id].erase(terminal_it);
