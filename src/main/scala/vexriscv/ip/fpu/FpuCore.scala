@@ -1848,6 +1848,10 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     val fregWriteToken = UInt(64 bits).setName("fregWriteToken").addAttribute(Verilator.public)
     val fregWriteHart = UInt(8 bits).setName("fregWriteHart").addAttribute(Verilator.public)
     val fregWriteIsDouble = p.withDouble generate Bool().setName("fregWriteIsDouble").addAttribute(Verilator.public)
+    // A normalized significand has its implicit bit at internalMantissaSize.
+    // Undoing F32 subnormal normalization therefore shifts by
+    // exponentOne + internalMantissaSize - 149 - exponent.
+    val f32SubnormalShiftBase = exponentOne + p.internalMantissaSize - 149
 
     fregWriteValid := False
     fregWriteReg   := 0
@@ -1891,7 +1895,12 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
             when(input.value.isCanonical){
               manFixed := U((BigInt(1) << 51), 52 bits)
             } otherwise {
-              manFixed := (manBase.asUInt | U((BigInt(1) << 51), 52 bits))
+              // This is an architectural write observation, not an arithmetic
+              // NaN propagation stage.  Bit-manipulation instructions such as
+              // FSGNJ must preserve a signaling-NaN payload verbatim; forcing
+              // the quiet bit here made the trace disagree with the value that
+              // was actually written into rf.ram.
+              manFixed := manBase.asUInt
             }
           }
 
@@ -1909,6 +1918,16 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
           when(input.value.isZero){
             expFixed32 := 0
             manFixed32 := 0
+          } elsewhen(!input.value.special && input.value.exponent <= U(exponentF32Subnormal)){
+            // FpuCore keeps finite subnormals normalized internally.  Merely
+            // slicing the internal mantissa and subtracting the exponent bias
+            // (the old debug-view implementation) loses low payload bits and
+            // can turn 0x007fffff into 0x007ffffe or even 0x75000000.  Undo the
+            // load-path normalization exactly, matching the STORE/FMV path and
+            // therefore the bits actually observable from the register file.
+            expFixed32 := 0
+            manFixed32 := (((U(1, 1 bits) @@ input.value.mantissa) >>
+              (U(f32SubnormalShiftBase) - input.value.exponent))(22 downto 0)).resized
           } elsewhen(input.value.isInfinity){
             expFixed32.setAll()
             manFixed32 := 0
@@ -1917,7 +1936,10 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
             when(input.value.isCanonical){
               manFixed32 := U((BigInt(1) << 22), 23 bits)
             } otherwise {
-              manFixed32 := (manBase32.asUInt | U((BigInt(1) << 22), 23 bits))
+              // Preserve the payload/quiet bit for architectural bit moves.
+              // Arithmetic paths that require canonical NaNs already mark the
+              // internal value canonical before reaching writeback.
+              manFixed32 := manBase32.asUInt
             }
           }
 
@@ -1939,6 +1961,10 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
         when(input.value.isZero){
           expFixed32 := 0
           manFixed32 := 0
+        } elsewhen(!input.value.special && input.value.exponent <= U(exponentF32Subnormal)){
+          expFixed32 := 0
+          manFixed32 := (((U(1, 1 bits) @@ input.value.mantissa) >>
+            (U(f32SubnormalShiftBase) - input.value.exponent))(22 downto 0)).resized
         } elsewhen(input.value.isInfinity){
           expFixed32.setAll()
           manFixed32 := 0
@@ -1947,7 +1973,7 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
           when(input.value.isCanonical){
             manFixed32 := U((BigInt(1) << 22), 23 bits)
           } otherwise {
-            manFixed32 := (manBase32.asUInt | U((BigInt(1) << 22), 23 bits))
+            manFixed32 := manBase32.asUInt
           }
         }
 

@@ -1942,6 +1942,14 @@ public:
 						<< "CXTRACE v=2 event=writeback core=VexRiscv hart=0 token=" << traceWrite.token
 						<< " cycle=" << traceWrite.writebackCycle
 						<< " rd_kind=f rd=" << (uint32_t)traceWrite.reg
+						<< " value=0x" << std::hex
+						#ifdef RVD
+						<< std::setw(16)
+						#else
+						<< std::setw(8)
+						#endif
+						<< std::setfill('0') << fval
+						<< std::dec << std::setfill(' ')
 						<< std::endl;
 					terminalTraceByToken.erase(terminalIt);
 				}
