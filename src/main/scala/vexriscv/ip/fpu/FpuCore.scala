@@ -1004,6 +1004,7 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
       if(p.withDouble) is(FpuOpcode.FCVT_X_X){
         rfOutput.format := ((input.format === FpuFormat.FLOAT) ? FpuFormat.DOUBLE | FpuFormat.FLOAT)
         when(input.rs1.isNan){
+          rfOutput.value.sign := False  // canonical NaN requires positive sign (spec norm:F_canonical_NaN)
           rfOutput.value.setNanQuiet
         }
       }
