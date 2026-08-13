@@ -959,11 +959,22 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
               when(input.rs1.isCanonical){
                 f32ManCorrected := U((BigInt(1) << 22), 23 bits)
               } otherwise {
-                // Use the RAW recode payload (f32.man, a pure input slice) for
-                // the OR — never CombInit(f32ManCorrected): that copies the
-                // whole assignment tree (including this when) and creates a
-                // combinational loop.
-                f32ManCorrected := (f32.man | U((BigInt(1) << 22), 23 bits)).resized
+                // fsgnj/fsgnjn/fsgnjx are pure bit-level sign manipulations
+                // (spec): the result is {sgnjResult} ## rs1[62:0] with the
+                // SNaN/QNaN payload copied verbatim. A transfer-loaded boxed
+                // NaN (fld/fmv.w.x/flw — load path uses setNan, canonical
+                // bit cleared) keeps its raw IEEE payload in f32.man, so
+                // spike's fsgnj.d on a boxed SNaN stays an SNaN. Quieting it
+                // here (OR 1<<22) is a spec violation. Only a NaN whose low
+                // 23-bit payload reads as 0 is an arithmetic recode (payload
+                // lives in the high mantissa bits, lost in this slice); such
+                // results are canonical after the arithmetic paths quiet them,
+                // so this is purely defensive.
+                when(f32.man === 0){
+                  f32ManCorrected := U((BigInt(1) << 22), 23 bits)
+                } otherwise {
+                  f32ManCorrected := f32.man
+                }
               }
             }
             // Boxed f32 ZERO (raw IEEE exp8 = 0, man23 = 0): the recoded zero
