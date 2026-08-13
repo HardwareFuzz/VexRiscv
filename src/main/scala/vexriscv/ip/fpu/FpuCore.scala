@@ -781,10 +781,10 @@ case class FpuCore( portCount : Int, p : FpuParameter) extends Component{
     }
     when(cononicalForced){
       whenDouble(input.format){
-        recodedResult(63) := False
+        // keep sign: STORE/FMV_X_W are bit-exact moves (spec norm); canonical
+        // NaN sign must not be flipped on the store bus
         recodedResult(51) := True
       }  {
-        recodedResult(31) := False
         recodedResult(22) := True
       }
     }
